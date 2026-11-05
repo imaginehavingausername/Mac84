@@ -67,7 +67,10 @@ class FreshnessTests(unittest.TestCase):
 class SpaceTests(unittest.TestCase):
     def device(self):
         dev = mb.MacInput(True,(320,240)); dev.dry_run = False
-        q = Mock(kCGEventFlagMaskControl=1<<18, kCGHIDEventTap=0)
+        # Real Quartz values: Control, Command, Shift, fn (SecondaryFn), keypad.
+        q = Mock(kCGEventFlagMaskControl=1<<18, kCGEventFlagMaskCommand=1<<20,
+                 kCGEventFlagMaskShift=1<<17, kCGEventFlagMaskSecondaryFn=1<<23,
+                 kCGEventFlagMaskNumericPad=1<<21, kCGHIDEventTap=0)
         q.CGEventCreateKeyboardEvent.side_effect = lambda source,key,down: (key,down)
         dev.quartz = q
         return dev,q
@@ -80,6 +83,11 @@ class SpaceTests(unittest.TestCase):
             self.assertEqual([c.args[1] for c in q.CGEventPost.call_args_list],
                              [(59,True),(code,True),(code,False),(59,False)])
             self.assertEqual(q.CGEventSetFlags.call_args_list[-1].args, ((59,False),0))
+            # macOS's Control+arrow shortcuts are defined WITH fn (0x840000);
+            # real arrow keys also carry the keypad flag.
+            arrow_flags = {c.args[1] for c in q.CGEventSetFlags.call_args_list
+                           if c.args[0][0] == code}
+            self.assertEqual(arrow_flags, {(1<<18) | (1<<23) | (1<<21)})
 
     def test_control_is_released_if_arrow_posting_fails(self):
         dev,q = self.device()

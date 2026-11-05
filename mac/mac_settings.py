@@ -37,6 +37,24 @@ LEGACY_TARGETS = {
 }
 
 
+# Read-only cross-check for restore: the preference behind each switch. It is
+# never WRITTEN (writing it does not apply the change on Sequoia).
+UI_PREFERENCE = {
+    'Reduce motion': ('com.apple.universalaccess', 'reduceMotion'),
+    'Prefer non-blinking cursor': ('com.apple.Accessibility', 'PrefersNonBlinkingCursorIndicator'),
+}
+
+
+def _stored_switch_value(label):
+    """'0'/'1' if the preference exists and is a clear Boolean, else None."""
+    domain, key = UI_PREFERENCE[label]
+    value = _read(domain, key)
+    if value is None:
+        return None  # missing proves nothing
+    value = value.strip().lower()
+    return '1' if value in ('1', 'true', 'yes') else '0' if value in ('0', 'false', 'no') else None
+
+
 def _supports_ui():
     return platform.system() == 'Darwin' and platform.mac_ver()[0].split('.')[0] == '15'
 
@@ -212,6 +230,7 @@ def _restore_settings(journal=JOURNAL):
             problems.append(str(ex))
     _refresh_clock()
     ui_entries = [item for item in entries if item.get('backend') == 'accessibility_ui']
+    ui_failures = []  # (item, error) for switches the UI could not restore
     if ui_entries:
         try:
             with AccessibilityUI() as ui:
@@ -232,9 +251,23 @@ def _restore_settings(journal=JOURNAL):
                         else:
                             restored += 1
                     except Exception as ex:
-                        problems.append(str(ex))
+                        ui_failures.append((item, ex))
         except Exception as ex:
-            problems.append(str(ex))
+            done = {id(item) for item, _ in ui_failures}
+            ui_failures += [(item, ex) for item in ui_entries if id(item) not in done]
+    for item, ex in ui_failures:
+        # v0.3.6: when switch automation fails (e.g. System Settings closed or
+        # still loading), the switch may already be back. Accept that only if
+        # its stored preference EXISTS and reads the original value.
+        try:
+            stored = _stored_switch_value(item['key'])
+        except Exception:
+            stored = None
+        if stored is not None and stored == item['original']:
+            print(f'[settings] {item["key"]}: switch automation failed ({ex}); its stored '
+                  f'preference already shows the original value, so it is restored.')
+            continue
+        problems.append(str(ex))
     if problems:
         # Keep backup to retry; do not silently declare success.
         raise RuntimeError('Settings restore incomplete: ' + '; '.join(problems) +

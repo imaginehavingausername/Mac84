@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mac84 v0.3.4 desktop mirroring USB bridge (independent of Gemini84).
+"""Mac84 v0.3.6 desktop mirroring USB bridge (independent of Gemini84).
 
 Local USB only. Captures the main macOS display, crops/resizes to 320x240,
 converts to RGB332 (256 colors), and sends only changed 16x16 tiles.
@@ -31,6 +31,11 @@ MAX_PATCHES = 36
 ACK_GROUP = 4   # Acknowledge every four completed tiles (both ends must match)
 ZOOM_MODES = (None, (960, 720), (640, 480), (480, 360), (320, 240))
 ZOOM_DEFAULT = 1  # screenshot 02_960x720, as requested
+BRIDGE_VERSION = '0.3.6'
+
+
+class CalculatorQuit(Exception):
+    """The calculator sent @BYE: the user quit with MODE. Not an error."""
 
 
 def rgb332_image(image: Image.Image) -> bytes:
@@ -168,27 +173,53 @@ class Geometry:
         py = self.crop_y + y * (self.crop_h - 1) / max(1, self.view_h - 1)
         return px, py
 
+    def clamped_point_from_view(self, view_x: int, view_y: int) -> tuple[float, float]:
+        """Like point_from_view, but a cursor in a letterbox bar maps to the
+        nearest desktop edge (used to choose a zoom centre)."""
+        x = min(max(view_x, self.view_x), self.view_x + self.view_w - 1)
+        y = min(max(view_y, self.view_y), self.view_y + self.view_h - 1)
+        return self.point_from_view(x, y)
 
-def crop_view(image: Image.Image, zoom_index: int, center_x: float,
-              center_y: float) -> tuple[Image.Image, Geometry]:
-    width, height = image.size
+    def view_from_point(self, px: float, py: float) -> tuple[int, int]:
+        """Inverse of point_from_view: where a desktop pixel appears on the TI."""
+        x = (px - self.crop_x) * max(1, self.view_w - 1) / max(1, self.crop_w - 1)
+        y = (py - self.crop_y) * max(1, self.view_h - 1) / max(1, self.crop_h - 1)
+        x = min(max(round(x), 0), self.view_w - 1)
+        y = min(max(round(y), 0), self.view_h - 1)
+        return self.view_x + x, self.view_y + y
+
+
+def layout(width: int, height: int, zoom_index: int, center_x: float,
+           center_y: float) -> Geometry:
+    """Where the view sits on the desktop, without needing pixels. Cropped
+    zooms are clamped so the view never extends past a desktop edge."""
     mode = ZOOM_MODES[zoom_index]
     if mode is None:
-        fitted = ImageOps.contain(image, (WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-        offset_x, offset_y = (WIDTH - fitted.width) // 2, (HEIGHT - fitted.height) // 2
-        shown = Image.new('RGB', (WIDTH, HEIGHT), (0, 0, 0))
-        shown.paste(fitted, (offset_x, offset_y))
-        return shown, Geometry(width, height, 0, 0, width, height,
-                               offset_x, offset_y, fitted.width, fitted.height)
+        scale = min(WIDTH / width, HEIGHT / height)
+        fit_w = max(1, round(width * scale))
+        fit_h = max(1, round(height * scale))
+        return Geometry(width, height, 0, 0, width, height,
+                        (WIDTH - fit_w) // 2, (HEIGHT - fit_h) // 2, fit_w, fit_h)
     wanted_w, wanted_h = mode
     scale = min(1.0, width / wanted_w, height / wanted_h)
     crop_w = max(1, round(wanted_w * scale))
     crop_h = max(1, round(wanted_h * scale))
     crop_x = max(0, min(round(center_x - crop_w / 2), width - crop_w))
     crop_y = max(0, min(round(center_y - crop_h / 2), height - crop_h))
-    shown = image.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
-    return shown.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS), Geometry(
-        width, height, crop_x, crop_y, crop_w, crop_h)
+    return Geometry(width, height, crop_x, crop_y, crop_w, crop_h)
+
+
+def crop_view(image: Image.Image, zoom_index: int, center_x: float,
+              center_y: float) -> tuple[Image.Image, Geometry]:
+    width, height = image.size
+    geo = layout(width, height, zoom_index, center_x, center_y)
+    if ZOOM_MODES[zoom_index] is None:
+        fitted = image.resize((geo.view_w, geo.view_h), Image.Resampling.LANCZOS)
+        shown = Image.new('RGB', (WIDTH, HEIGHT), (0, 0, 0))
+        shown.paste(fitted, (geo.view_x, geo.view_y))
+        return shown, geo
+    shown = image.crop((geo.crop_x, geo.crop_y, geo.crop_x + geo.crop_w, geo.crop_y + geo.crop_h))
+    return shown.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS), geo
 
 
 class Screen:
@@ -249,6 +280,9 @@ class MacInput:
             except ImportError as ex:
                 raise RuntimeError('Install macOS Quartz bindings: pip install pyobjc-framework-Quartz') from ex
             self.quartz = Quartz
+        self.dragging = False
+        self.drag_point: Optional[tuple[float, float]] = None
+        self._helpers: list[subprocess.Popen] = []
 
     def to_mac_points(self, px: float, py: float) -> tuple[float, float]:
         if self.dry_run:
@@ -266,9 +300,33 @@ class MacInput:
             return
         q = self.quartz
         point = self.to_mac_points(px, py)
-        event = q.CGEventCreateMouseEvent(None, q.kCGEventMouseMoved, point,
-                                          q.kCGMouseButtonLeft)
+        # While drag lock holds the button, apps expect drag events, not moves.
+        kind = q.kCGEventLeftMouseDragged if self.dragging else q.kCGEventMouseMoved
+        event = q.CGEventCreateMouseEvent(None, kind, point, q.kCGMouseButtonLeft)
         q.CGEventPost(q.kCGHIDEventTap, event)
+        if self.dragging:
+            self.drag_point = (px, py)
+
+    def drag(self, state: str, px: float, py: float):
+        """2ND+TRACE drag lock: 'D' presses and holds the left button, arrows
+        drag, TRACE ('U') releases. Used for drag-and-drop and text selection."""
+        if state not in ('D', 'U'):
+            raise ValueError('Invalid drag state')
+        if self.dry_run or (state == 'U' and not self.dragging) or (state == 'D' and self.dragging):
+            return
+        q = self.quartz
+        point = self.to_mac_points(px, py)
+        kind = q.kCGEventLeftMouseDown if state == 'D' else q.kCGEventLeftMouseUp
+        event = q.CGEventCreateMouseEvent(None, kind, point, q.kCGMouseButtonLeft)
+        q.CGEventSetIntegerValueField(event, q.kCGMouseEventClickState, 1)
+        q.CGEventPost(q.kCGHIDEventTap, event)
+        self.dragging = state == 'D'
+        self.drag_point = (px, py) if self.dragging else None
+
+    def release_drag(self):
+        """Never leave the Mac's mouse button stuck down when the bridge stops."""
+        if self.dragging and self.drag_point is not None:
+            self.drag('U', *self.drag_point)
 
     def click(self, button: str, px: float, py: float):
         if self.dry_run:
@@ -293,7 +351,14 @@ class MacInput:
                                              max(-20, min(20, lines)))
         q.CGEventPost(q.kCGHIDEventTap, ev)
 
-    CONTROL, COMMAND = 59, 55  # left modifier key codes
+    CONTROL, COMMAND, SHIFT = 59, 55, 56  # left modifier key codes
+    ARROWS = (123, 124, 125, 126)
+    # B|name requests from the calculator; a fixed whitelist, never arbitrary keys.
+    NAMED_KEYS = {
+        'RETURN': (36, ()), 'ESC': (53, ()),
+        'CUT': (7, (COMMAND,)), 'COPY': (8, (COMMAND,)), 'PASTE': (9, (COMMAND,)),
+        'ALL': (0, (COMMAND,)), 'UNDO': (6, (COMMAND,)), 'REDO': (6, (COMMAND, SHIFT)),
+    }
 
     def key_combo(self, key: int, modifiers: tuple[int, ...] = ()):
         """Press key with modifiers held, releasing every modifier even if
@@ -303,7 +368,13 @@ class MacInput:
             return
         q = self.quartz
         masks = {self.CONTROL: q.kCGEventFlagMaskControl,
-                 self.COMMAND: q.kCGEventFlagMaskCommand}
+                 self.COMMAND: q.kCGEventFlagMaskCommand,
+                 self.SHIFT: q.kCGEventFlagMaskShift}
+        # Real Mac arrow keys carry the fn + keypad flags, and macOS defines
+        # Control+arrow shortcuts (Mission Control, Spaces) WITH fn. Without it
+        # v0.3.4's Control+Up reached the app as a plain Up arrow.
+        key_flags = (q.kCGEventFlagMaskSecondaryFn | q.kCGEventFlagMaskNumericPad
+                     if key in self.ARROWS else 0)
         flags = 0
         held = []
         try:
@@ -315,7 +386,7 @@ class MacInput:
                 held.append(mod)
             for down in (True, False):
                 ev = q.CGEventCreateKeyboardEvent(None, key, down)
-                q.CGEventSetFlags(ev, flags)
+                q.CGEventSetFlags(ev, flags | key_flags)
                 q.CGEventPost(q.kCGHIDEventTap, ev)
                 time.sleep(.015)
         finally:
@@ -331,11 +402,27 @@ class MacInput:
             raise ValueError('Invalid Space direction')
         self.key_combo(123 if direction == 'L' else 124, (self.CONTROL,))
 
-    def show_windows(self, app_only: bool = False):
-        """Mission Control (Control+Up) or App Expose (Control+Down): the
-        default shortcuts, same family as Control+Left/Right. Press again to
-        close, or click a window with TRACE to switch to it."""
+    MISSION_CONTROL = '/System/Applications/Mission Control.app/Contents/MacOS/Mission Control'
+
+    def show_windows(self, app_only: bool = False) -> str:
+        """WINDOW: Mission Control. 2ND+WINDOW: App Expose (argument 2).
+        Launching Mission Control directly does not depend on keyboard-shortcut
+        settings or synthetic modifier flags. Falls back to Control+Up/Down."""
+        if self.dry_run:
+            return 'dry run'
+        self._helpers = [h for h in self._helpers if h.poll() is None]  # reap
+        if os.path.exists(self.MISSION_CONTROL):
+            self._helpers.append(subprocess.Popen(
+                [self.MISSION_CONTROL] + (['2'] if app_only else []),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True))
+            return 'App Expose' if app_only else 'Mission Control'
         self.key_combo(125 if app_only else 126, (self.CONTROL,))
+        return 'Control+Down' if app_only else 'Control+Up'
+
+    def press_named(self, name: str):
+        key, modifiers = self.NAMED_KEYS[name]
+        self.key_combo(key, modifiers)
 
     def double_click(self, px: float, py: float):
         if self.dry_run:
@@ -436,6 +523,9 @@ class ViewSession:
         self.packed_tiles = False   # enabled only by the calculator's @M84|5
         self.ack_window = 1         # ACK groups in flight; 1 = proven behaviour
         self.synced = True          # last batch emptied the change list
+        self.pending_cursor: Optional[tuple[int, int]] = None  # sent before next F|
+        self.calculator_version: Optional[str] = None
+        self.greeted = False
         self.restart_from_top()
 
     def restart_from_top(self):
@@ -452,6 +542,29 @@ class ViewSession:
             self.old_tiles.clear()
             self.pending.clear()
             self.restart_from_top()
+
+    def zoom_at(self, delta: int, view_x: int, view_y: int) -> Optional[tuple[float, float]]:
+        """v0.3.6 +/-: re-centre on the desktop point under the calculator
+        cursor, clamped so the view stays fully on the desktop, and queue the
+        cursor's new position so it stays on that point. Returns the point."""
+        geo = self.current_geometry
+        if geo is None:
+            self.zoom_by(delta)
+            return None
+        new_index = max(0, min(len(ZOOM_MODES) - 1, self.zoom + delta))
+        if new_index == self.zoom:
+            return None
+        px, py = geo.clamped_point_from_view(view_x, view_y)
+        new_geo = layout(geo.image_width, geo.image_height, new_index, px, py)
+        self.zoom = new_index
+        self.center_x = new_geo.crop_x + new_geo.crop_w / 2
+        self.center_y = new_geo.crop_y + new_geo.crop_h / 2
+        self.current_geometry = new_geo  # input mapping matches the next image
+        self.pending_cursor = new_geo.view_from_point(px, py)
+        self.old_tiles.clear()
+        self.pending.clear()
+        self.restart_from_top()
+        return px, py
 
     def pan(self, dx: int, dy: int):
         geo = self.current_geometry
@@ -477,6 +590,11 @@ class ViewSession:
         self.center_y = max(0, min(raw.height, self.center_y))
         output, geometry = crop_view(raw, self.zoom, self.center_x, self.center_y)
         self.current_geometry = geometry
+        if ZOOM_MODES[self.zoom] is not None:
+            # Keep the centre at the CLAMPED crop's centre, so panning back from
+            # an edge responds immediately instead of first undoing overshoot.
+            self.center_x = geometry.crop_x + geometry.crop_w / 2
+            self.center_y = geometry.crop_y + geometry.crop_h / 2
         pixels = rgb332_image(output)
         if self.synced:
             # The previous pass finished: start this one at the top instead of
@@ -524,6 +642,8 @@ def _read_ack(wire, session: ViewSession, where: str):
             f'Calculator USB link vanished while waiting for an ACK ({where}): {exc}. '
             'MAC84 stopped first; its screen should show the reason '
             '(v0.3.3+). Note that message before pressing CLEAR.') from exc
+    if ack == b'@BYE\n':
+        raise CalculatorQuit()
     if ack != b'A\n':
         raise RuntimeError(f'ACK failure ({where}): got {ack!r} '
                            f'(empty means no reply within the 2 s timeout). '
@@ -548,7 +668,12 @@ def send_frame(wire, session: ViewSession, pace: float = .003, log=False):
         print(f'Batch {batch}: {len(changes)} tiles [{kinds}], more={int(more)}, '
               f'capture+encode {1000 * (rendered - started):.0f} ms, '
               f'{len(session.old_tiles)}/{COLS * ROWS} tiles confirmed', flush=True)
-    stream = bytearray(f'F|{len(changes)}|{int(more)}\n'.encode('ascii'))
+    stream = bytearray()
+    if session.pending_cursor is not None:
+        # Only queued for v0.3.6+ calculators (they send Z with coordinates).
+        stream += 'M|{}|{}\n'.format(*session.pending_cursor).encode('ascii')
+        session.pending_cursor = None
+    stream += f'F|{len(changes)}|{int(more)}\n'.encode('ascii')
     window = max(1, int(session.ack_window))
     in_flight = []  # [(where, [(tx, ty, block), ...])], oldest first
     group = []
@@ -584,20 +709,32 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
                   link_test: bool = False):
     fields = message.split('|')
     command = fields[0]
-    if message in ('@M84', '@M84|4', '@M84|5'):
+    if message == '@BYE':
+        raise CalculatorQuit()
+    if message in ('@M84', '@M84|4') or message.startswith('@M84|5'):
         session.old_tiles.clear()
         session.pending.clear()
+        session.pending_cursor = None
         session.restart_from_top()
-        # |5 = v0.3.4 calculator: understands packed 'Q' tiles. Older greetings
+        # |5 = v0.3.4+ calculator: understands packed 'Q' tiles. Older greetings
         # keep the original raw/RLE tiles, so mixed versions still work.
-        session.packed_tiles = message == '@M84|5'
-        reply = {'@M84': b'@M84READY\n', '@M84|4': b'@M84READY|4\n',
-                 '@M84|5': b'@M84READY|5\n'}[message]
+        session.packed_tiles = message.startswith('@M84|5')
+        reply = b'@M84READY|5\n' if session.packed_tiles else (
+            b'@M84READY|4\n' if message == '@M84|4' else b'@M84READY\n')
         wire.write(reply)
         wire.flush()
-        if log:
-            print(f'[usb] Calculator greeting {message}; packed tiles '
+        version = fields[2] if len(fields) > 2 else None  # v0.3.6+ sends it
+        if not session.greeted or version != session.calculator_version or log:
+            session.greeted = True
+            session.calculator_version = version
+            shown = version or ('0.3.4/0.3.5' if session.packed_tiles else 'older than 0.3.4')
+            print(f'[usb] Calculator program MAC84 v{shown}; packed tiles '
                   f'{"on" if session.packed_tiles else "off"}', flush=True)
+            if version != BRIDGE_VERSION:
+                print(f'[usb] WARNING: this bridge is v{BRIDGE_VERSION} but the calculator runs '
+                      f'MAC84 v{shown}. Send calculator/bin/MAC84.8xp from THIS folder '
+                      f'({Path(__file__).resolve().parents[1]}) with TI Connect CE, or newer '
+                      'buttons will not work.', flush=True)
         return
     if command == 'V' and len(fields) == 1:
         if link_test:
@@ -617,8 +754,14 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
             if coord[1] >= 12:
                 del session.old_tiles[coord]
         return
-    if command == 'Z' and len(fields) == 2:
-        session.zoom_by(-1 if fields[1] == '-' else 1)
+    if command == 'Z' and len(fields) in (2, 4) and fields[1] in ('+', '-'):
+        delta = -1 if fields[1] == '-' else 1
+        if len(fields) == 4:  # v0.3.6+: zoom around the calculator cursor
+            point = session.zoom_at(delta, int(fields[2]), int(fields[3]))
+            if point is not None and input_dev is not None:
+                input_dev.move(*point)  # Mac pointer stays on the zoomed spot
+        else:
+            session.zoom_by(delta)
         return
     if command == 'P' and len(fields) == 3:
         session.pan(int(fields[1]), int(fields[2]))
@@ -650,8 +793,22 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
         return
     if command == 'X' and len(fields) == 2 and fields[1] in ('M', 'A'):
         # WINDOW: Mission Control (all windows). 2ND+WINDOW: App Expose.
-        input_dev.show_windows(fields[1] == 'A')
+        what = input_dev.show_windows(fields[1] == 'A')
         session.pending.clear()
+        if log:
+            print(f'[input] WINDOW: {what}', flush=True)
+        return
+    if command == 'G' and len(fields) == 4 and fields[1] in ('D', 'U'):
+        # 2ND+TRACE drag lock: D holds the left button, U releases it.
+        point = session.view_to_point(int(fields[2]), int(fields[3]))
+        if point is None and fields[1] == 'U':
+            point = input_dev.drag_point  # release even if the pointer is in a bar
+        if point is not None:
+            input_dev.drag(fields[1], *point)
+        return
+    if command == 'B' and len(fields) == 2 and fields[1] in MacInput.NAMED_KEYS:
+        # ENTER, 2ND+CLEAR, MATH/APPS/PRGM, 2ND+ALPHA, X,T,O,n (+2ND).
+        input_dev.press_named(fields[1])
         return
     if command == 'S' and len(fields) == 2 and fields[1] in ('L', 'R'):
         input_dev.switch_space(fields[1])
@@ -711,6 +868,7 @@ def main(argv=None) -> int:
             print(port.device, port.description)
         return 0
     screen = Screen(a.mock_image, a.display)
+    device = None
     try:
         session = ViewSession(screen)
         session.ack_window = a.ack_window
@@ -753,8 +911,9 @@ def main(argv=None) -> int:
             raise RuntimeError('pyserial missing: pip install pyserial')
         device = DeferredMacInput(session, dry_run=a.mock_image is not None or a.link_test)
         port = select_port(a.port)
-        print('Mac84 v0.3.4 bridge on', port, '| v0.3 USB protocol (+packed tiles) | default zoom 960x720'
+        print(f'Mac84 v{BRIDGE_VERSION} bridge on', port, '| v0.3 USB protocol (+packed tiles) | default zoom 960x720'
               + (f' | ack window {a.ack_window}' if a.ack_window != 1 else ''), flush=True)
+        print(f'Running from {Path(__file__).resolve().parents[1]}', flush=True)
         print('Do not run Gemini84 bridge at the same time. Ctrl+C to stop.', flush=True)
         # SIGTERM should unwind the settings context, not leave modified preferences.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
@@ -794,6 +953,10 @@ def main(argv=None) -> int:
                     if line == 'V' and len(session.old_tiles) == COLS * ROWS:
                         settings.start()
                     requests += 1
+                except CalculatorQuit:
+                    print('[usb] MAC84 was quit on the calculator (MODE). Bridge stopping normally.',
+                          flush=True)
+                    return 0
                 except (ValueError, RuntimeError) as exc:
                     print('Request error:', exc, file=sys.stderr, flush=True)
                     # Stop rather than allow a mismatched tile stream to corrupt display.
@@ -801,6 +964,12 @@ def main(argv=None) -> int:
                         raise
         return 0
     finally:
+        backend = getattr(device, 'backend', None) if device is not None else None
+        if backend is not None:
+            try:
+                backend.release_drag()
+            except Exception as exc:  # report, but never mask the real error
+                print(f'[input] Could not release drag-lock mouse button: {exc}', file=sys.stderr)
         screen.close()
 
 

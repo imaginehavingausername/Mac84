@@ -52,14 +52,24 @@ on run argv
     set operation to item 1 of argv
     set wantedLabel to item 2 of argv
     if wantedLabel is not "Reduce motion" and wantedLabel is not "Prefer non-blinking cursor" then error "Unsupported control"
-    with timeout of 12 seconds
+    with timeout of 20 seconds
         set theToggle to missing value
-        repeat 10 times
-            set theToggle to my findToggle(wantedLabel)
+        set lastProblem to ""
+        -- System Settings may still be launching or switching to the Display
+        -- pane (common at restore time, after it was closed). Its window can
+        -- vanish mid-search (-1728); retry for up to ~8 s instead of aborting.
+        repeat 32 times
+            try
+                set theToggle to my findToggle(wantedLabel)
+            on error errText number errNum
+                if errText starts with "Ambiguous" then error errText number errNum
+                set lastProblem to " Last error: " & errText
+                set theToggle to missing value
+            end try
             if theToggle is not missing value then exit repeat
-            delay 0.1
+            delay 0.25
         end repeat
-        if theToggle is missing value then error "Could not find " & wantedLabel & " in Accessibility > Display. Check Terminal Accessibility and Automation permissions, or open that page manually."
+        if theToggle is missing value then error "Could not find " & wantedLabel & " in Accessibility > Display. Check Terminal Accessibility and Automation permissions, or open that page manually." & lastProblem
         set currentValue to my switchValue(theToggle)
         if operation is "read" then return currentValue
         if operation is not "set" or (count argv) is not 4 then error "Invalid operation"

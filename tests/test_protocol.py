@@ -76,7 +76,9 @@ class ProtocolTests(unittest.TestCase):
                 frames = diagnostics = 0
                 while True:
                     line = wire.readline().decode().strip()
-                    if line == 'DONE': break
+                    if line.startswith('DONE'):
+                        self.assertEqual(line, 'DONE|37|201')  # M| line moved the cursor
+                        break
                     self.assertIn(line.split('|')[0], ('@M84','V','D'))
                     if line.startswith('@M84'): self.assertEqual(line, '@M84|5')
                     if line.startswith('D|'): diagnostics += 1
@@ -84,6 +86,7 @@ class ProtocolTests(unittest.TestCase):
                     if line == 'V':
                         frames += 1
                         if frames == 1: source.image = latest
+                        if frames == 2: session.pending_cursor = (37, 201)
                 self.assertEqual(child.wait(timeout=3),0)
             self.assertEqual(frames,11)
             self.assertTrue(session.packed_tiles)

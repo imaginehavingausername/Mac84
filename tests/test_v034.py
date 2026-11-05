@@ -127,6 +127,49 @@ class ControlTests(unittest.TestCase):
         x, y = dev.calls[0][1:]
         self.assertAlmostEqual(x, 1512, delta=2); self.assertAlmostEqual(y, 982, delta=2)
 
+    def test_v035_named_keys_and_drag(self):
+        session = mb.ViewSession(DummyScreen(Image.new('RGB', (3024, 1964))))
+        session.render()
+        dev = Recorder()
+        for name in ('RETURN', 'ESC', 'CUT', 'COPY', 'PASTE', 'ALL', 'UNDO', 'REDO'):
+            mb.parse_request(FakeSerial(), session, dev, 'B|' + name, 0)
+        mb.parse_request(FakeSerial(), session, dev, 'B|DELETE_EVERYTHING', 0)  # not whitelisted
+        mb.parse_request(FakeSerial(), session, dev, 'G|D|160|120', 0)
+        mb.parse_request(FakeSerial(), session, dev, 'G|U|170|120', 0)
+        self.assertEqual([c[1] for c in dev.calls if c[0] == 'press_named'],
+                         ['RETURN', 'ESC', 'CUT', 'COPY', 'PASTE', 'ALL', 'UNDO', 'REDO'])
+        self.assertEqual([c[1] for c in dev.calls if c[0] == 'drag'], ['D', 'U'])
+        self.assertEqual(mb.MacInput.NAMED_KEYS['REDO'], (6, (55, 56)))  # Cmd+Shift+Z
+        self.assertEqual(mb.MacInput.NAMED_KEYS['COPY'], (8, (55,)))     # Cmd+C
+
+    def test_arrow_shortcuts_carry_fn_flag_and_drag_is_released(self):
+        posted = []
+        class Q:  # minimal Quartz stand-in recording flags and event kinds
+            kCGEventFlagMaskControl, kCGEventFlagMaskCommand, kCGEventFlagMaskShift = 1, 2, 4
+            kCGEventFlagMaskSecondaryFn, kCGEventFlagMaskNumericPad = 8, 16
+            kCGHIDEventTap = 0
+            kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGEventLeftMouseDragged, kCGEventMouseMoved = 'down', 'up', 'drag', 'move'
+            kCGMouseButtonLeft, kCGMouseEventClickState = 0, 0
+            def CGEventCreateKeyboardEvent(self, _, key, down): return {'key': key, 'down': down}
+            def CGEventSetFlags(self, ev, flags): ev['flags'] = flags
+            def CGEventCreateMouseEvent(self, _, kind, point, button): return {'kind': kind}
+            def CGEventSetIntegerValueField(self, *a): pass
+            def CGEventPost(self, tap, ev): posted.append(ev)
+            def CGMainDisplayID(self): return 1
+            def CGDisplayBounds(self, _):
+                from types import SimpleNamespace as N
+                return N(origin=N(x=0, y=0), size=N(width=1512, height=982))
+        dev = mb.MacInput(True, (3024, 1964)); dev.dry_run = False; dev.quartz = Q()
+        dev.switch_space('L')
+        arrow = [e for e in posted if e.get('key') == 123]
+        self.assertTrue(arrow and all(e['flags'] == 1 | 8 | 16 for e in arrow))
+        posted.clear(); dev.press_named('COPY')
+        self.assertTrue(all(e['flags'] & 8 == 0 for e in posted))  # no fn on letters
+        posted.clear()
+        dev.drag('D', 100, 100); dev.move(120, 100); dev.release_drag()
+        self.assertEqual([e['kind'] for e in posted], ['down', 'drag', 'up'])
+        self.assertFalse(dev.dragging)
+
     def test_dry_run_input_methods_are_safe(self):
         dev = mb.MacInput(True, (3024, 1964))
         dev.double_click(1, 1); dev.show_windows(); dev.show_windows(True)

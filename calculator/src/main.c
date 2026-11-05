@@ -1,5 +1,5 @@
 /*
- * MAC84 v0.3.4 — TI-84 Plus CE native USB desktop viewer.
+ * MAC84 v0.3.6 — TI-84 Plus CE native USB desktop viewer.
  * Mac -> TI: F|n|more\n, followed by T|x|y|P/R|len\n + len binary bytes per tile, E\n.
  * TI -> Mac: V\n requests up to 36 dirty 16x16 tiles.
  * The TI returns A\n after each group of four tiles or the final shorter group.
@@ -22,6 +22,9 @@
 #define ACK_GROUP 4
 #define MAX_TILE_PACKET 512
 #define OVERLAY_Y 192
+/* |5 = packed tiles; the version lets the Mac warn about a stale program. */
+#define MAC84_VERSION "0.3.6"
+#define GREETING "@M84|5|" MAC84_VERSION "\n"
 #define OVERLAY_H 48
 
 static srl_device_t srl;
@@ -53,6 +56,7 @@ static bool cursor_visible = false;
 static bool online = false;
 static int cursor_x = 160, cursor_y = 120;
 static bool force_refresh = false;
+static bool dragging = false;  /* 2ND+TRACE drag lock: Mac left button held */
 
 /* v0.3.3 diagnostics: every stop records WHY, so the calculator never exits
    silently. Only the first reason after a reset is kept (it is the cause;
@@ -65,6 +69,9 @@ static unsigned batch_number = 0;
 static int stage_tile = 0, stage_total = 0;
 static unsigned usb_event_errors = 0, usb_errors_reported = 0;
 static int last_usb_error = 0;
+/* Disconnect events for some OTHER device object. v0.3.2 treated these as
+   fatal; v0.3.3+ ignores them. Counted to confirm the v0.3.2 root cause. */
+static unsigned foreign_disconnects = 0, foreign_reported = 0;
 
 static void fail(const char *reason) {
     if (!fail_reason[0]) {
@@ -89,10 +96,13 @@ static void note_bad_line(const char *line) {
 static usb_error_t usb_callback(usb_event_t event, void *data,
                                  usb_callback_data_t *callback) {
     /* Same rule as Gemini84: only OUR serial device going away is fatal. */
-    if (event == USB_DEVICE_DISCONNECTED_EVENT && link_open &&
-        (link_device == NULL || data == link_device)) {
-        link_lost = true;
-        fail("USB disconnect event from Mac");
+    if (event == USB_DEVICE_DISCONNECTED_EVENT && link_open) {
+        if (link_device == NULL || data == link_device) {
+            link_lost = true;
+            fail("USB disconnect event from Mac");
+        } else {
+            ++foreign_disconnects;
+        }
     }
     return srl_UsbEventCallback(event, data, callback);
 }
@@ -245,8 +255,14 @@ static void cursor_show(void) {
             int x = cursor_x + dx, y = cursor_y + dy;
             cursor_bg[n++] = (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H)
                 ? gfx_vbuffer[y][x] : 0;
-            if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H &&
-                (dx == 0 || dy == 0)) {
+            if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) continue;
+            if (dragging) {
+                /* Drag lock: square outline so a held button is obvious. */
+                if (dx == -4 || dx == 4 || dy == -4 || dy == 4)
+                    gfx_vbuffer[y][x] = ((dx + dy) & 1) ? 0 : 255;
+                else if (dx == 0 && dy == 0)
+                    gfx_vbuffer[y][x] = 0;
+            } else if (dx == 0 || dy == 0) {
                 gfx_vbuffer[y][x] = (dx == 0 && dy == 0) ? 0 : 255;
             }
         }
@@ -368,12 +384,34 @@ static bool fetch_frame(void) {
         stage = "sending diagnostic";
         if (!send_line(note)) return false;
     }
+    if (foreign_disconnects != foreign_reported) {
+        char note[40];
+        snprintf(note, sizeof(note), "D|other_device_disconnect|%u\n",
+                 foreign_disconnects);
+        foreign_reported = foreign_disconnects;
+        stage = "sending diagnostic";
+        if (!send_line(note)) return false;
+    }
     stage = "requesting update";
     if (!send_line("V\n")) return false;
     stage = "waiting for batch header";
     for (i = 0; i < 40; ++i) {
         if (!recv_line(line, sizeof(line), 8)) return false;
         if (!strncmp(line, "@M84READY", 9)) continue;  /* any version's reply */
+        if (line[0] == 'M' && line[1] == '|') {
+            /* Mac moved the pointer (zoom around cursor): follow it. */
+            char *end;
+            long x = strtol(line + 2, &end, 10), y;
+            if (*end++ != '|') { note_bad_line(line); fail("Bad pointer line"); return false; }
+            y = strtol(end, &end, 10);
+            if (*end || x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) {
+                note_bad_line(line); fail("Bad pointer line"); return false;
+            }
+            cursor_hide();  /* restore the old spot before moving */
+            cursor_x = (int)x;
+            cursor_y = (int)y;
+            continue;
+        }
         if (line[0] == 'F' && line[1] == '|') break;
         note_bad_line(line);
         fail("Unexpected line, wanted F|");
@@ -507,9 +545,10 @@ static void input_redraw(void) {
     for (y = OVERLAY_Y; y < SCREEN_H; ++y)
         memset(gfx_vbuffer[y], 0, SCREEN_W);
     editor_string("ENTER:SEND MODE:CANCEL 2ND+MODE:QUIT", 3, OVERLAY_Y + 2);
-    editor_string(edit_mode == 0 ? "LETTERS  2ND+ALPHA:CHANGE  2ND+0:SPACE" :
-                  edit_mode == 1 ? "NUMBERS  2ND+ALPHA:CHANGE" :
-                                   "SYMBOLS  2ND+ALPHA:CHANGE", 3, OVERLAY_Y + 14);
+    editor_string(edit_mode == 0 ? "abc  0:SPACE  2ND+ALPHA:NEXT MODE" :
+                  edit_mode == 1 ? "ABC  0:SPACE  2ND+ALPHA:NEXT MODE" :
+                  edit_mode == 2 ? "123 +-*/^().,  2ND+ALPHA:NEXT MODE" :
+                                   "!?:@#=';\"&%$_[]<>  2ND+ALPHA:abc", 3, OVERLAY_Y + 14);
     if (edit_pos > 35) start = edit_pos - 35;
     count = edit_len - start;
     if (count > 36) count = 36;
@@ -554,71 +593,48 @@ static void input_insert(char c) {
     input_redraw();
 }
 
-static char letter_key(void) {
-    /* TI-84 CE physical alpha legend (A through Z). */
-    if (hotkey(2, kb_Math)) return 'a';
-    if (hotkey(3, kb_Apps)) return 'b';
-    if (hotkey(4, kb_Prgm)) return 'c';
-    if (hotkey(2, kb_Recip)) return 'd';
-    if (hotkey(3, kb_Sin)) return 'e';
-    if (hotkey(4, kb_Cos)) return 'f';
-    if (hotkey(5, kb_Tan)) return 'g';
-    if (hotkey(6, kb_Power)) return 'h';
-    if (hotkey(2, kb_Square)) return 'i';
-    if (hotkey(3, kb_Comma)) return 'j';
-    if (hotkey(4, kb_LParen)) return 'k';
-    if (hotkey(5, kb_RParen)) return 'l';
-    if (hotkey(6, kb_Div)) return 'm';
-    if (hotkey(2, kb_Log)) return 'n';
-    if (hotkey(2, kb_Ln)) return 'o';
-    if (hotkey(2, kb_Sto)) return 'p';
-    if (hotkey(3, kb_7)) return 'q';
-    if (hotkey(4, kb_8)) return 'r';
-    if (hotkey(5, kb_9)) return 's';
-    if (hotkey(3, kb_4)) return 't';
-    if (hotkey(4, kb_5)) return 'u';
-    if (hotkey(5, kb_6)) return 'v';
-    if (hotkey(3, kb_1)) return 'w';
-    if (hotkey(4, kb_2)) return 'x';
-    if (hotkey(5, kb_3)) return 'y';
-    if (hotkey(3, kb_0)) return 'z';
-    return 0;
-}
+/* v0.3.6: one table per physical key, from the TI-84 Plus CE's printed
+   legends. Columns: letters (green ALPHA legend; 0 = none), numbers/operators
+   (white key face), symbols (extra punctuation for URLs, email, code).
+   v0.3.5 and earlier used a wrong layout below "N" (7 typed q, LN typed o...). */
+static const struct EditKey {
+    uint8_t group, bit;
+    char letter, face, symbol;
+} edit_keys[] = {
+    {2, kb_Math,   'a', 0,   0  }, {3, kb_Apps,  'b', 0,   0  },
+    {4, kb_Prgm,   'c', 0,   0  },
+    {2, kb_Recip,  'd', 0,   '>'}, {3, kb_Sin,   'e', 0,   0  },
+    {4, kb_Cos,    'f', 0,   0  }, {5, kb_Tan,   'g', 0,   0  },
+    {6, kb_Power,  'h', '^', '~'},
+    {2, kb_Square, 'i', 0,   '<'}, {3, kb_Comma, 'j', ',', '|'},
+    {4, kb_LParen, 'k', '(', '['}, {5, kb_RParen, 'l', ')', ']'},
+    {6, kb_Div,    'm', '/', '\\'},
+    {2, kb_Log,    'n', 0,   '{'}, {3, kb_7,     'o', '7', '\''},
+    {4, kb_8,      'p', '8', '"'}, {5, kb_9,     'q', '9', ';'},
+    {6, kb_Mul,    'r', '*', '$'},
+    {2, kb_Ln,     's', 0,   '}'}, {3, kb_4,     't', '4', '@'},
+    {4, kb_5,      'u', '5', '#'}, {5, kb_6,     'v', '6', '='},
+    {6, kb_Sub,    'w', '-', '%'},
+    {2, kb_Sto,    'x', 0,   '`'}, {3, kb_1,     'y', '1', '!'},
+    {4, kb_2,      'z', '2', '?'}, {5, kb_3,     0,   '3', ':'}, /* theta: not ASCII */
+    {6, kb_Add,    '"', '+', '&'},
+    {3, kb_0,      ' ', '0', ' '}, {4, kb_DecPnt, ':', '.', '.'},
+    {5, kb_Chs,    '?', '-', '_'},
+};
 
-static char number_key(void) {
-    if (hotkey(3, kb_0)) return '0';
-    if (hotkey(3, kb_1)) return '1';
-    if (hotkey(4, kb_2)) return '2';
-    if (hotkey(5, kb_3)) return '3';
-    if (hotkey(3, kb_4)) return '4';
-    if (hotkey(4, kb_5)) return '5';
-    if (hotkey(5, kb_6)) return '6';
-    if (hotkey(3, kb_7)) return '7';
-    if (hotkey(4, kb_8)) return '8';
-    if (hotkey(5, kb_9)) return '9';
-    if (hotkey(4, kb_DecPnt)) return '.';
-    return 0;
-}
+#define EDIT_MODES 4  /* 0 letters, 1 LETTERS, 2 numbers, 3 symbols */
 
-static char symbol_key(void) {
-    if (hotkey(3, kb_0)) return ' ';
-    if (hotkey(6, kb_Add)) return '+';
-    if (hotkey(6, kb_Sub)) return '-';
-    if (hotkey(6, kb_Mul)) return '*';
-    if (hotkey(6, kb_Div)) return '/';
-    if (hotkey(6, kb_Power)) return '^';
-    if (hotkey(4, kb_DecPnt)) return '.';
-    if (hotkey(3, kb_Comma)) return ',';
-    if (hotkey(4, kb_LParen)) return '(';
-    if (hotkey(5, kb_RParen)) return ')';
-    if (hotkey(3, kb_1)) return '!';
-    if (hotkey(4, kb_2)) return '?';
-    if (hotkey(5, kb_3)) return ':';
-    if (hotkey(3, kb_4)) return '@';
-    if (hotkey(4, kb_5)) return '#';
-    if (hotkey(5, kb_6)) return '=';
-    if (hotkey(3, kb_7)) return '\'';
-    if (hotkey(4, kb_8)) return '"';
+static char edit_key_char(void) {
+    unsigned i;
+    for (i = 0; i < sizeof(edit_keys) / sizeof(edit_keys[0]); ++i) {
+        const struct EditKey *k = &edit_keys[i];
+        if (!hotkey(k->group, k->bit)) continue;
+        if (edit_mode == 0) return k->letter;
+        if (edit_mode == 1)
+            return (k->letter >= 'a' && k->letter <= 'z') ? (char)(k->letter - 32) : k->letter;
+        if (edit_mode == 2) return k->face;
+        return k->symbol;
+    }
     return 0;
 }
 
@@ -655,7 +671,7 @@ static void show_stop_screen(void) {
     gfx_FillRectangle_NoClip(0, 166, 320, 2);
     gfx_SetTextBGColor(255);
     gfx_SetTextFGColor(224);
-    gfx_PrintStringXY("MAC84 v0.3.4 STOPPED", 4, y); y += 14;
+    gfx_PrintStringXY("MAC84 v" MAC84_VERSION " STOPPED", 4, y); y += 14;
     gfx_SetTextFGColor(0);
     gfx_PrintStringXY(fail_reason[0] ? fail_reason : "No reason recorded", 4, y); y += 12;
     snprintf(text, sizeof(text), "While: %s", stage);
@@ -678,14 +694,14 @@ static void show_stop_screen(void) {
 }
 
 static void input_keys(void) {
-    char c;
     if (hotkey(6, kb_Clear)) {
         edit_len = edit_pos = 0; edit_text[0] = 0; input_redraw(); return;
     }
     if (hotkey(1, kb_Mode)) { input_stop(false); return; }
     if (hotkey(6, kb_Enter)) { input_stop(true); return; }
     if (hotkey(2, kb_Alpha)) {
-        edit_mode = shift_held() ? (uint8_t)((edit_mode + 1) % 3) : 0;
+        /* ALPHA: back to lowercase letters. 2ND+ALPHA: next mode. */
+        edit_mode = shift_held() ? (uint8_t)((edit_mode + 1) % EDIT_MODES) : 0;
         input_redraw();
         return;
     }
@@ -699,8 +715,7 @@ static void input_keys(void) {
     if (hotkey(7, kb_Left) && edit_pos > 0) { --edit_pos; input_redraw(); return; }
     if (hotkey(7, kb_Right) && edit_pos < edit_len) { ++edit_pos; input_redraw(); return; }
     if (shift_held() && hotkey(3, kb_0)) { input_insert(' '); return; }
-    c = edit_mode == 0 ? letter_key() : edit_mode == 1 ? number_key() : symbol_key();
-    input_insert(c);
+    input_insert(edit_key_char());
 }
 
 static void remote_keys(void) {
@@ -724,7 +739,21 @@ static void remote_keys(void) {
     }
     /* Top row, left to right: Y= look, WINDOW windows, ZOOM double, TRACE
        left, GRAPH right. */
-    if (hotkey(1, kb_Trace)) { send_click('L'); force_refresh = true; }
+    if (hotkey(1, kb_Trace)) {
+        if (dragging || pan) {
+            /* 2ND+TRACE picks up; TRACE (with or without 2ND) drops. */
+            char cmd[24];
+            dragging = !dragging;
+            snprintf(cmd, sizeof(cmd), "G|%c|%d|%d\n", dragging ? 'D' : 'U',
+                     cursor_x, cursor_y);
+            send_line(cmd);
+            cursor_hide();
+            cursor_show();
+        } else {
+            send_click('L');
+        }
+        force_refresh = true;
+    }
     if (hotkey(1, kb_Graph)) { send_click('R'); force_refresh = true; }
     if (hotkey(1, kb_Zoom)) { send_click('D'); force_refresh = true; }
     if (hotkey(1, kb_Yequ)) {
@@ -736,17 +765,33 @@ static void remote_keys(void) {
     if (hotkey(1, kb_Window)) { send_line(pan ? "X|A\n" : "X|M\n"); force_refresh = true; }
     if (hotkey(6, kb_Power)) { send_line("W|3\n"); force_refresh = true; }
     if (hotkey(6, kb_Div)) { send_line("W|-3\n"); force_refresh = true; }
-    if (hotkey(6, kb_Add)) {
-        if (zoom_level < 4) ++zoom_level;
-        send_line("Z|+\n"); force_refresh = true;
-    }
-    if (hotkey(6, kb_Sub)) {
-        if (zoom_level > 0) --zoom_level;
-        send_line("Z|-\n"); force_refresh = true;
+    if (hotkey(6, kb_Add) || hotkey(6, kb_Sub)) {
+        /* v0.3.6: zoom around the cursor. The Mac re-centres on the desktop
+           point under the cursor (clamped to the desktop edges) and sends back
+           where that point now is, so the cursor stays on it. */
+        char cmd[24];
+        bool in = hotkey(6, kb_Add);
+        if (in && zoom_level < 4) ++zoom_level;
+        if (!in && zoom_level > 0) --zoom_level;
+        snprintf(cmd, sizeof(cmd), "Z|%c|%d|%d\n", in ? '+' : '-', cursor_x, cursor_y);
+        send_line(cmd);
+        force_refresh = true;
     }
     if (hotkey(5, kb_Vars)) { send_line("S|L\n"); force_refresh = true; }
-    if (hotkey(6, kb_Clear)) { send_line("S|R\n"); force_refresh = true; }
-    if (hotkey(2, kb_Alpha)) input_start();
+    if (hotkey(6, kb_Clear)) { send_line(pan ? "B|ESC\n" : "S|R\n"); force_refresh = true; }
+    if (hotkey(6, kb_Enter)) { send_line("B|RETURN\n"); force_refresh = true; }
+    /* Edit shortcuts. In the ALPHA editor these keys still type letters. */
+    if (hotkey(2, kb_Math)) { send_line("B|CUT\n"); force_refresh = true; }
+    if (hotkey(3, kb_Apps)) { send_line("B|COPY\n"); force_refresh = true; }
+    if (hotkey(4, kb_Prgm)) { send_line("B|PASTE\n"); force_refresh = true; }
+    if (hotkey(3, kb_GraphVar)) {
+        send_line(pan ? "B|REDO\n" : "B|UNDO\n");
+        force_refresh = true;
+    }
+    if (hotkey(2, kb_Alpha)) {
+        if (pan) { send_line("B|ALL\n"); force_refresh = true; }
+        else input_start();
+    }
 }
 
 int main(void) {
@@ -759,7 +804,7 @@ int main(void) {
     palette_init();
     gfx_FillScreen(255);
     gfx_SetTextFGColor(0);
-    gfx_PrintStringXY("MAC84 v0.3.4", 4, 6);
+    gfx_PrintStringXY("MAC84 v" MAC84_VERSION, 4, 6);
     gfx_PrintStringXY("Waiting for USB...", 4, 22);
     if (usb_Init(usb_callback, NULL,
                  srl_GetCDCStandardDescriptors(), USB_DEFAULT_INIT_FLAGS) != USB_SUCCESS) {
@@ -787,7 +832,7 @@ int main(void) {
     stage = "handshake";
     for (i = 0; i < 40; ++i) {
         fail_reason[0] = 0;  /* a retry timeout is expected here, not a cause */
-        if (!send_line("@M84|5\n")) {
+        if (!send_line(GREETING)) {
             gfx_PrintStringXY("USB write failed", 4, 54);
             gfx_PrintStringXY(fail_reason, 4, 70);
             goto wait_for_exit;
@@ -806,7 +851,7 @@ int main(void) {
     /* A plain @M84READY may be the bridge's proactive port-open READY, sent
        before it saw our greeting. Repeat the greeting so a v0.3.4 bridge
        enables packed tiles; an older bridge just logs and ignores it. */
-    if (strcmp(line, "@M84READY|5") && !send_line("@M84|5\n")) {
+    if (strcmp(line, "@M84READY|5") && !send_line(GREETING)) {
         show_stop_screen();
         goto cleanup_serial;
     }
@@ -842,8 +887,24 @@ int main(void) {
         gfx_SetTextBGColor(255);
         gfx_PrintStringXY("MAC84: quit by MODE key", 4, 116);
         {
+            /* Tell the Mac this was intentional, then keep draining what it
+               is still sending so its write finishes and it reads the BYE
+               (instead of reporting "link vanished"). send_line() refuses
+               once quit is requested, so write directly. */
+            static const char bye[] = "@BYE\n";
+            size_t sent = 0;
+            uint8_t sink[64];
             clock_t until = clock() + CLOCKS_PER_SEC * 3 / 4;
-            while (clock() < until) usb_poll();
+            while (clock() < until && !link_lost) {
+                int n;
+                usb_poll();
+                if (sent < sizeof(bye) - 1) {
+                    n = srl_Write(&srl, bye + sent, sizeof(bye) - 1 - sent);
+                    if (n > 0) sent += (size_t)n;
+                }
+                n = srl_Read(&srl, sink, sizeof(sink));
+                if (n < 0) break;
+            }
         }
     } else {
         show_stop_screen();

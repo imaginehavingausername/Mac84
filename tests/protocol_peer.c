@@ -41,6 +41,10 @@ int main(int argc, char **argv) {
     assert(out);
     assert(fwrite(gfx_vbuffer, 1, sizeof(gfx_vbuffer), out) == sizeof(gfx_vbuffer));
     fclose(out);
-    assert(send_line("DONE\n"));
+    {
+        char done[40];
+        snprintf(done, sizeof(done), "DONE|%d|%d\n", cursor_x, cursor_y);
+        assert(send_line(done));  /* reports where M| put the cursor */
+    }
     return 0;
 }

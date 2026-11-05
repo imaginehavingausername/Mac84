@@ -25,7 +25,7 @@ class AccessibilityUI:
         if label not in LABELS:
             raise ValueError('Unsupported accessibility setting')
         try:
-            result = run_command(['osascript', str(SCRIPT), action, label, *values], timeout=15)
+            result = run_command(['osascript', str(SCRIPT), action, label, *values], timeout=25)
         except subprocess.TimeoutExpired:
             raise RuntimeError(f'{label}: System Events timed out. Mirroring continues. '
                                'Check Terminal Accessibility and Automation permissions.') from None
