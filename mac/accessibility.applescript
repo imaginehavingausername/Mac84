@@ -6,33 +6,57 @@ on normalizedLabel(rawLabel)
     return labelText
 end normalizedLabel
 
+property lastSeen : ""
+
 on findToggle(wantedLabel)
     tell application "System Events"
-        if not (exists process "System Settings") then return missing value
+        if not (exists process "System Settings") then
+            set my lastSeen to "System Settings is not running"
+            return missing value
+        end if
         tell process "System Settings"
-            if not (exists window 1) then return missing value
+            set windowList to windows
+            if (count windowList) is 0 then
+                set my lastSeen to "System Settings has no window open"
+                return missing value
+            end if
             set candidates to {}
-            set nodes to entire contents of window 1
-            repeat with nodeRef in nodes
-                set matched to false
+            set seenParts to {}
+            -- Every window, not only window 1 (v0.3.6 searched window 1 only).
+            repeat with winItem in windowList
+                set win to contents of winItem
+                set winName to "?"
                 try
-                    set nodeRole to value of attribute "AXRole" of nodeRef
-                    if nodeRole is "AXCheckBox" or nodeRole is "AXSwitch" then
-                        set nodeName to ""
-                        set nodeDescription to ""
-                        try
-                            set nodeName to my normalizedLabel(name of nodeRef)
-                        end try
-                        try
-                            set nodeDescription to my normalizedLabel(description of nodeRef)
-                        end try
-                        ignoring case
-                            set matched to nodeName is wantedLabel or nodeDescription is wantedLabel
-                        end ignoring
-                    end if
+                    set winName to (name of win) as text
                 end try
-                if matched then set end of candidates to contents of nodeRef
+                set switchCount to 0
+                set nodes to entire contents of win
+                repeat with nodeRef in nodes
+                    set matched to false
+                    try
+                        set nodeRole to value of attribute "AXRole" of nodeRef
+                        if nodeRole is "AXCheckBox" or nodeRole is "AXSwitch" then
+                            set switchCount to switchCount + 1
+                            set nodeName to ""
+                            set nodeDescription to ""
+                            try
+                                set nodeName to my normalizedLabel(name of nodeRef)
+                            end try
+                            try
+                                set nodeDescription to my normalizedLabel(description of nodeRef)
+                            end try
+                            ignoring case
+                                set matched to nodeName is wantedLabel or nodeDescription is wantedLabel
+                            end ignoring
+                        end if
+                    end try
+                    if matched then set end of candidates to contents of nodeRef
+                end repeat
+                set end of seenParts to "'" & winName & "' with " & switchCount & " switches"
             end repeat
+            set AppleScript's text item delimiters to ", "
+            set my lastSeen to "System Settings showed " & (seenParts as text)
+            set AppleScript's text item delimiters to ""
             if (count candidates) is greater than 1 then error "Ambiguous accessibility control: " & wantedLabel
             if (count candidates) is 1 then return item 1 of candidates
         end tell
@@ -57,8 +81,10 @@ on run argv
         set lastProblem to ""
         -- System Settings may still be launching or switching to the Display
         -- pane (common at restore time, after it was closed). Its window can
-        -- vanish mid-search (-1728); retry for up to ~8 s instead of aborting.
-        repeat 32 times
+        -- vanish mid-search (-1728); retry for ~6 s. The Python caller then
+        -- re-opens the Display pane and runs this once more.
+        set startedAt to current date
+        repeat
             try
                 set theToggle to my findToggle(wantedLabel)
             on error errText number errNum
@@ -67,9 +93,10 @@ on run argv
                 set theToggle to missing value
             end try
             if theToggle is not missing value then exit repeat
+            if ((current date) - startedAt) > 6 then exit repeat
             delay 0.25
         end repeat
-        if theToggle is missing value then error "Could not find " & wantedLabel & " in Accessibility > Display. Check Terminal Accessibility and Automation permissions, or open that page manually." & lastProblem
+        if theToggle is missing value then error "Could not find " & wantedLabel & " in Accessibility > Display (" & lastSeen & "). Check Terminal Accessibility and Automation permissions, or open that page manually." & lastProblem
         set currentValue to my switchValue(theToggle)
         if operation is "read" then return currentValue
         if operation is not "set" or (count argv) is not 4 then error "Invalid operation"

@@ -2,10 +2,10 @@
 
 **Control your Mac from a TI-84 Plus CE.** Mac84 mirrors your Mac's screen onto the
 calculator over USB. From the keypad you can point, click, drag, scroll, zoom, type,
-use shortcuts like copy, paste and undo, and switch Spaces.
+use shortcuts like copy, paste and undo, open Mission Control, and switch Spaces.
 
-> **This is Version 3 (v0.3.6)**: full keyboard shortcuts, drag and drop, zooming
-> around the pointer, and typing that matches the letters printed on the keys.
+> **This is Version 4 (v0.3.7), the current version**: it starts by itself when you
+> plug in the calculator, and Mission Control works.
 > **Designed and tested on macOS Sequoia 15.3.1** (English system language) with a
 > TI-84 Plus CE Python running OS 5.8.0.022. Other setups are untested.
 
@@ -57,9 +57,12 @@ the USB cable; nothing goes over the network.
 ```sh
 git clone https://github.com/imaginehavingausername/Mac84.git
 cd Mac84
-python3 -m venv .venv
-./.venv/bin/python -m pip install -r mac/requirements.txt
+zsh mac/install_autostart.command
 ```
+
+This sets up the Python environment and turns on [auto-start](#auto-start). To start
+the bridge only by hand instead, run
+`python3 -m venv .venv && ./.venv/bin/python -m pip install -r mac/requirements.txt`.
 
 ### 3. Grant macOS permissions
 
@@ -71,24 +74,29 @@ you use) under:
 - **Automation → System Events**, to flip switches in System Settings (macOS asks on
   first run)
 
-Then quit and reopen Terminal.
+Then quit and reopen Terminal. If macOS later asks whether something may control
+Terminal, allow it; that is auto-start opening and closing its window.
 
 ### 4. Run it
 
-1. Plug in the calculator, start arTIfiCE and choose **MAC84**. The screen shows
-   `MAC84 v0.3.6` and `Waiting for Mac bridge...`.
-2. Within 80 seconds, start the bridge from the `Mac84` folder (or double-click
-   `mac/run_mac.command`):
+1. Plug in the calculator. With auto-start on, a Terminal window opens and waits.
+2. On the calculator, start arTIfiCE and choose **MAC84**. The screen shows
+   `MAC84 v0.3.6` (the calculator program did not change in v0.3.7) and
+   `Waiting for Mac bridge...`.
+3. Without auto-start, start the bridge within 80 seconds from the `Mac84` folder (or
+   double-click `mac/run_mac.command`):
 
    ```sh
    ./.venv/bin/python mac/mac84_bridge.py --port auto --pace 0.003
    ```
 
-3. Terminal shows `[usb] Calculator program MAC84 v0.3.6; packed tiles on`, and the
+4. Terminal shows `[usb] Calculator program MAC84 v0.3.6; packed tiles on`, and the
    screen fills in over a few seconds. After that, only changed areas are sent.
 
-**To stop,** press `mode` on the calculator. The bridge restores your Mac settings and
-exits. (`Ctrl+C` in Terminal also works; wait for the `[settings]` lines to finish.)
+**To stop,** press `mode` on the calculator; the bridge restores your Mac settings. With
+auto-start, the window stays open and reconnects if you start MAC84 again; unplug the
+calculator to close it. Without auto-start, the bridge exits. (`Ctrl+C` also works;
+wait for the `[settings]` lines to finish.)
 
 ## Controls
 
@@ -100,7 +108,7 @@ exits. (`Ctrl+C` in Terminal also works; wait for the `[settings]` lines to fini
 | `+` / `−` | Zoom in / out around the pointer |
 | `^` / `÷` | Scroll up / down |
 | `y=` | Quick Look on a Finder item (press again to close); Look Up the word under the pointer elsewhere |
-| `window` / `2nd` + `window` | Mission Control / App Exposé *(see [Known issues](#known-issues))* |
+| `window` / `2nd` + `window` | Mission Control, like F3 (`trace` a window to switch to it, `window` again to close) / App Exposé |
 | `vars` / `clear` | Switch to the Space on the left / right |
 | `enter` / `2nd` + `clear` | Return / Escape |
 | `math` / `apps` / `prgm` | Cut / Copy / Paste |
@@ -144,7 +152,7 @@ In letter modes, each key types the green letter printed above it. The full char
 A ticking clock, animations and a blinking cursor keep changing the screen, and every
 change costs USB time. So while the bridge runs, it hides the menu bar clock's seconds
 and flashing separators, and turns on **Reduce motion** and **Prefer non-blinking
-cursor**. System Settings opens to flip those two switches; switch back to your app
+cursor**. System Settings opens briefly to flip Reduce motion; switch back to your app
 afterwards. This starts after the first full screen, and mirroring continues meanwhile.
 
 Your original values are saved to
@@ -158,16 +166,19 @@ kept. Don't delete it; with the bridge stopped, run:
 
 To leave your settings alone entirely, add `--no-mac-settings`.
 
-## Known issues
+## Auto-start
 
-- **`window` doesn't open Mission Control.** Terminal prints
-  `[input] WINDOW: Mission Control`, but macOS Sequoia blocks the way this version
-  launches it, so nothing appears. A later version fixes this.
-- **The two accessibility switches sometimes fail** with `Could not find Reduce motion`,
-  because System Settings can ignore the link to its Display page when it starts up
-  slowly. Mirroring and the clock changes are unaffected. If it fails every time, check
-  the Automation permission and that macOS is set to English, or skip this step with
-  `--no-mac-settings`.
+`mac/install_autostart.command` installs a small background watcher (LaunchAgent
+`com.local.mac84watcher`) that checks USB every 2 seconds. When the calculator appears,
+it opens Terminal running the bridge in `--auto` mode, which waits for MAC84 and
+reconnects each time you start it. About 8 seconds after you unplug, the bridge
+finishes restoring settings and exits, and the watcher closes the window. The Mac can't
+start MAC84 for you; always launch it from arTIfiCE.
+
+- **Moved the Mac84 folder?** Run the installer again from the new location.
+- **Turn it off:** `zsh mac/uninstall_autostart.command`
+- **Logs:** `~/Library/Application Support/Mac84/autostart.log` (watcher) and
+  `~/Library/Logs/Mac84/last_auto_session.log` (the last window's output).
 
 ## Command-line options
 
@@ -175,6 +186,7 @@ To leave your settings alone entirely, add `--no-mac-settings`.
 | --- | --- |
 | `--port auto` / `--port /dev/cu.usbmodem...` | Find the calculator automatically (default) / use a specific port |
 | `--list-ports` | List candidate serial ports and exit |
+| `--auto` | Wait for MAC84, reconnect after each session, exit when unplugged (used by auto-start) |
 | `--verbose` | Log every request, plus each batch's tile kinds, timing and KB/s |
 | `--no-mac-settings` | Don't change or restore any Mac settings |
 | `--restore-settings` | Restore settings saved by an interrupted run, then exit |
@@ -192,12 +204,15 @@ captures another display.
 | --- | --- |
 | Calculator says `No bridge after 80 sec` | Start the bridge sooner after launching MAC84 |
 | Bridge can't find the calculator | Quit TI Connect CE, use a data cable, and try `--list-ports` |
+| No window opens when you plug in | Check `autostart.log` (see [Auto-start](#auto-start)); run the installer again |
+| Bridge can't lock the serial port | Another bridge already has the calculator. Only one runs at a time, so don't start one by hand while the auto-start window is open |
 | Terminal shows a `WARNING` about the calculator version | The calculator has an older MAC84; send `calculator/bin/MAC84.8xp` again |
 | Calculator shows a `MAC84 v0.3.6 STOPPED` panel | It lists the reason and the USB stage. Note it, then press `clear` |
 | Image is blank, or the pointer doesn't move on the Mac | Screen Recording or Accessibility permission for Terminal |
 | Terminal output makes the image busy | Keep Terminal outside the captured area |
 
-To capture a detailed log for an issue report:
+With auto-start, the last session's output is in `last_auto_session.log`. To capture a
+detailed log by hand for an issue report:
 
 ```sh
 ./.venv/bin/python mac/mac84_bridge.py --port auto --pace 0.003 --verbose 2>&1 | tee ~/Desktop/mac84_run.log
@@ -205,7 +220,7 @@ To capture a detailed log for an issue report:
 
 ## For developers
 
-Run the 71 tests (they use mocks and never change your real settings; the C tests build
+Run the 103 tests (they use mocks and never change your real settings; the C tests build
 with clang from Xcode Command Line Tools):
 
 ```sh

@@ -95,7 +95,7 @@ static void note_bad_line(const char *line) {
 
 static usb_error_t usb_callback(usb_event_t event, void *data,
                                  usb_callback_data_t *callback) {
-    /* Same rule as Gemini84: only OUR serial device going away is fatal. */
+    /* Only OUR serial device going away is fatal. */
     if (event == USB_DEVICE_DISCONNECTED_EVENT && link_open) {
         if (link_device == NULL || data == link_device) {
             link_lost = true;
@@ -109,7 +109,7 @@ static usb_error_t usb_callback(usb_event_t event, void *data,
 
 /* usb_HandleEvents() returns whatever a callback returned. srldrvce may
    legitimately return non-success codes (e.g. USB_IGNORE = 1 after it answers
-   a CDC setup request). CEdev's srl_echo example and Gemini84 ignore this value
+   a CDC setup request). CEdev's srl_echo example ignores this value
    and detect real failures through negative srl_Read/srl_Write results.
    v0.3.2 treated it as a lost link and quit silently. Count it and report it
    to the Mac instead; a dead link still fails through srl_Read/srl_Write. */

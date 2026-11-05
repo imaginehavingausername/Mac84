@@ -174,6 +174,8 @@ class RecoveryTests(unittest.TestCase):
         with patch.dict(sys.modules,{'AppKit':None}), \
              patch.object(ma,'run_command',return_value=test_settings.DummyResult()) as run:
             with ma.AccessibilityUI(): pass
-        self.assertEqual(run.call_count,1)
-        self.assertEqual(run.call_args.args[0][0],'open')
+        # v0.3.7: a pgrep for System Settings precedes open; still no System Events.
+        commands=[c.args[0][0] for c in run.call_args_list]
+        self.assertEqual(commands,['pgrep','open'])
+        self.assertNotIn('osascript',commands)
 

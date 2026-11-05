@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Mac84 v0.3.6 desktop mirroring USB bridge (independent of Gemini84).
+"""Mac84 v0.3.7 desktop mirroring USB bridge.
 
 Local USB only. Captures the main macOS display, crops/resizes to 320x240,
 converts to RGB332 (256 colors), and sends only changed 16x16 tiles.
 The calculator requests each update and ACKs each group of four tiles.
-This is a protocol change from v0.2: update both calculator and Mac bridge. Do not run alongside Gemini bridge.
+This is a protocol change from v0.2: update both calculator and Mac bridge.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import argparse
 from dataclasses import dataclass
 import io
 import os
+import re
 import signal
 from pathlib import Path
 import subprocess
@@ -31,7 +32,10 @@ MAX_PATCHES = 36
 ACK_GROUP = 4   # Acknowledge every four completed tiles (both ends must match)
 ZOOM_MODES = (None, (960, 720), (640, 480), (480, 360), (320, 240))
 ZOOM_DEFAULT = 1  # screenshot 02_960x720, as requested
-BRIDGE_VERSION = '0.3.6'
+BRIDGE_VERSION = '0.3.7'
+# Calculator programs this bridge fully supports. v0.3.7 changed only the Mac
+# side, so MAC84 v0.3.6 on the calculator stays current.
+COMPATIBLE_CALCULATORS = ('0.3.6', '0.3.7')
 
 
 class CalculatorQuit(Exception):
@@ -282,7 +286,6 @@ class MacInput:
             self.quartz = Quartz
         self.dragging = False
         self.drag_point: Optional[tuple[float, float]] = None
-        self._helpers: list[subprocess.Popen] = []
 
     def to_mac_points(self, px: float, py: float) -> tuple[float, float]:
         if self.dry_run:
@@ -402,23 +405,79 @@ class MacInput:
             raise ValueError('Invalid Space direction')
         self.key_combo(123 if direction == 'L' else 124, (self.CONTROL,))
 
-    MISSION_CONTROL = '/System/Applications/Mission Control.app/Contents/MacOS/Mission Control'
+    # WINDOW asks the Dock directly, exactly like F3 (the Mission Control app
+    # is only a wrapper around this call): no app launch, no focus change.
+    # Checked on this Mac (Sequoia 15.3.1): opens, stays open, a second call
+    # closes it. v0.3.5/v0.3.6 executed the app's binary instead, which
+    # Sequoia's launch constraints SIGKILL (AMFI log), so WINDOW did nothing.
+    DOCK_MISSION_CONTROL = 'com.apple.expose.awake'
+    # 2ND+WINDOW: App Expose = the Mission Control app with argument "2",
+    # started through LaunchServices (checked: opens, and toggles closed).
+    MISSION_CONTROL_APP = 'com.apple.exposelauncher'
+
+    def _dock_notify(self, name: str) -> Optional[str]:
+        """Send a Dock notification. None on success, else the reason."""
+        if 'unittest' in sys.modules:  # tests must never open Mission Control
+            return 'Dock notifications disabled under unit tests'
+        try:
+            import ctypes
+            cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+            hi = ctypes.CDLL('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+            send = hi.CoreDockSendNotification
+        except (OSError, AttributeError) as exc:
+            return f'CoreDockSendNotification unavailable ({exc})'
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        send.argtypes, send.restype = [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int
+        text = cf.CFStringCreateWithCString(None, name.encode(), 0x08000100)  # UTF-8
+        if not text:
+            return 'could not create the notification name'
+        try:
+            status = send(text, None)
+        finally:
+            cf.CFRelease(text)
+        return None if status == 0 else f'CoreDockSendNotification returned {status}'
+
+    def _open_mission_control_app(self, app_only: bool) -> Optional[str]:
+        """Start the Mission Control app via LaunchServices. None on success."""
+        command = ['/usr/bin/open', '-b', self.MISSION_CONTROL_APP]
+        if app_only:
+            command += ['--args', '2']
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return str(exc)
+        if result.returncode == 0:
+            return None
+        return (result.stderr or result.stdout).strip() or f'exit {result.returncode}'
 
     def show_windows(self, app_only: bool = False) -> str:
-        """WINDOW: Mission Control. 2ND+WINDOW: App Expose (argument 2).
-        Launching Mission Control directly does not depend on keyboard-shortcut
-        settings or synthetic modifier flags. Falls back to Control+Up/Down."""
+        """WINDOW: Mission Control (F3). 2ND+WINDOW: App Expose. Pressing it
+        again while open closes it. Each falls back to the other method, then
+        to the Control+Up/Down shortcut."""
         if self.dry_run:
             return 'dry run'
-        self._helpers = [h for h in self._helpers if h.poll() is None]  # reap
-        if os.path.exists(self.MISSION_CONTROL):
-            self._helpers.append(subprocess.Popen(
-                [self.MISSION_CONTROL] + (['2'] if app_only else []),
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True))
-            return 'App Expose' if app_only else 'Mission Control'
+        problems = []
+        if not app_only:
+            problem = self._dock_notify(self.DOCK_MISSION_CONTROL)
+            if problem is None:
+                return 'Mission Control'
+            problems.append(problem)
+        problem = self._open_mission_control_app(app_only)
+        if problem is None:
+            return 'App Expose' if app_only else 'Mission Control (via app)'
+        problems.append(f'open -b {self.MISSION_CONTROL_APP} failed: {problem}')
+        if app_only:
+            # Last non-keyboard route for App Expose: the Dock's own notification.
+            problem = self._dock_notify('com.apple.expose.front.awake')
+            if problem is None:
+                return 'App Expose (via Dock)'
+            problems.append(problem)
         self.key_combo(125 if app_only else 126, (self.CONTROL,))
-        return 'Control+Down' if app_only else 'Control+Up'
+        return (('Control+Down' if app_only else 'Control+Up') +
+                ' shortcut (' + '; '.join(problems) + ')')
 
     def press_named(self, name: str):
         key, modifiers = self.NAMED_KEYS[name]
@@ -727,12 +786,13 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
         if not session.greeted or version != session.calculator_version or log:
             session.greeted = True
             session.calculator_version = version
-            shown = version or ('0.3.4/0.3.5' if session.packed_tiles else 'older than 0.3.4')
-            print(f'[usb] Calculator program MAC84 v{shown}; packed tiles '
+            shown = (f'v{version}' if version else
+                     'v0.3.4/0.3.5' if session.packed_tiles else '(older than v0.3.4)')
+            print(f'[usb] Calculator program MAC84 {shown}; packed tiles '
                   f'{"on" if session.packed_tiles else "off"}', flush=True)
-            if version != BRIDGE_VERSION:
+            if version not in COMPATIBLE_CALCULATORS:
                 print(f'[usb] WARNING: this bridge is v{BRIDGE_VERSION} but the calculator runs '
-                      f'MAC84 v{shown}. Send calculator/bin/MAC84.8xp from THIS folder '
+                      f'MAC84 {shown}. Send calculator/bin/MAC84.8xp from THIS folder '
                       f'({Path(__file__).resolve().parents[1]}) with TI Connect CE, or newer '
                       'buttons will not work.', flush=True)
         return
@@ -795,8 +855,7 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
         # WINDOW: Mission Control (all windows). 2ND+WINDOW: App Expose.
         what = input_dev.show_windows(fields[1] == 'A')
         session.pending.clear()
-        if log:
-            print(f'[input] WINDOW: {what}', flush=True)
+        print(f'[input] WINDOW: {what}', flush=True)  # always: rare, and key for diagnosis
         return
     if command == 'G' and len(fields) == 4 and fields[1] in ('D', 'U'):
         # 2ND+TRACE drag lock: D holds the left button, U releases it.
@@ -831,16 +890,102 @@ def ports():
     return list(list_ports.comports())
 
 
+TI_VENDOR_ID = 0x0451  # Texas Instruments, in TI-OS link mode and in MAC84
+
+
+def matching_ports() -> list[str]:
+    return [p.device for p in ports() if (
+        'usbmodem' in p.device.lower() or 'usbserial' in p.device.lower() or
+        'texas instruments' in (p.description or '').lower() or p.vid == TI_VENDOR_ID)]
+
+
 def select_port(override: str) -> str:
     if override != 'auto':
         return override
-    found = [p.device for p in ports() if (
-        'usbmodem' in p.device.lower() or 'usbserial' in p.device.lower() or
-        'texas instruments' in (p.description or '').lower() or p.vid == 0x0451)]
+    found = matching_ports()
     if len(found) != 1:
         raise RuntimeError('Found ' + str(len(found)) + ' matching USB ports. '
                            'Start MAC84 first; use --list-ports or --port DEVICE.')
     return found[0]
+
+
+def calculator_plugged_in() -> Optional[bool]:
+    """True while a TI calculator is on USB in any mode (TI-OS link before
+    MAC84 starts, or MAC84's serial port). None if ioreg itself failed."""
+    try:
+        out = subprocess.run(['/usr/sbin/ioreg', '-p', 'IOUSB', '-l', '-w', '0'],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return bool(re.search(rf'"idVendor" = {TI_VENDOR_ID}\b', out)) or 'TI-84 Plus CE' in out
+
+
+def wait_for_mac84_port(gone_after: float = 8.0, poll: float = .5,
+                        sleep=time.sleep, clock=time.monotonic) -> Optional[str]:
+    """--auto: wait until MAC84 opens its USB serial port and return it.
+    Returns None once no TI calculator has been on USB for gone_after
+    seconds. Short gaps (the calculator re-enumerates when MAC84 starts or
+    quits) are not treated as unplugging."""
+    last_seen = clock()
+    next_usb_check = 0.0
+    warned = False
+    while True:
+        found = matching_ports()
+        if len(found) == 1:
+            sleep(.5)  # let the calculator finish configuring its serial port
+            return found[0]
+        if len(found) > 1 and not warned:
+            warned = True
+            print(f'[auto] {len(found)} USB serial ports found ({", ".join(found)}); waiting until '
+                  'only one remains. Or stop this window and use --port DEVICE.', flush=True)
+        now = clock()
+        if now >= next_usb_check:
+            next_usb_check = now + 2
+            if calculator_plugged_in() is not False:  # present, or ioreg failed
+                last_seen = now
+            elif now - last_seen >= gone_after:
+                return None
+        sleep(poll)
+
+
+def wait_for_port_to_close(port: str, poll: float = .5, sleep=time.sleep) -> None:
+    """After a session, wait until MAC84 has released its port (it does on
+    quit or when its STOPPED panel is dismissed) so the next wait does not
+    reconnect to a program that is closing or to another bridge's port."""
+    hinted = False
+    for _ in range(int(2 / poll)):
+        if port not in matching_ports():
+            return
+        sleep(poll)
+    while port in matching_ports():
+        if not hinted:
+            hinted = True
+            print(f'[auto] Waiting for {port} to close. If the calculator shows a STOPPED panel, '
+                  'press CLEAR. If another Mac84 bridge is running, stop it.', flush=True)
+        sleep(poll)
+
+
+def run_auto(argv: list[str]) -> int:
+    """Started by the plug-in watcher (mac/mac84_session.command): wait for
+    MAC84, run one normal session (Mac settings applied and restored as
+    usual), then wait again. Ends when the calculator is unplugged, or on
+    Ctrl+C."""
+    argv = [x for x in argv if x != '--auto']
+    print(f'Mac84 v{BRIDGE_VERSION} auto-start (running from {Path(__file__).resolve().parents[1]})',
+          flush=True)
+    while True:
+        print('[auto] Waiting for MAC84 on the calculator. Start it from arTIfiCE. '
+              'Unplug the calculator to close this window.', flush=True)
+        port = wait_for_mac84_port()
+        if port is None:
+            print('[auto] Calculator unplugged; auto-start finished.', flush=True)
+            return 0
+        try:
+            main(argv + ['--port', port])
+        except (RuntimeError, OSError) as exc:  # e.g. the cable was pulled mid-session
+            print('ERROR:', exc, file=sys.stderr, flush=True)
+        print('[auto] Session ended.', flush=True)
+        wait_for_port_to_close(port)
 
 
 def main(argv=None) -> int:
@@ -859,6 +1004,9 @@ def main(argv=None) -> int:
     p.add_argument('--restore-settings', action='store_true', help='Recover settings after a previous crash')
     p.add_argument('--link-test', action='store_true',
                    help='USB handshake and frame headers only; no image or Mac controls')
+    p.add_argument('--auto', action='store_true',
+                   help='Wait for MAC84, reconnect after each session, exit when the calculator '
+                        'is unplugged (used by the plug-in auto-start)')
     a = p.parse_args(argv)
     if a.restore_settings:
         restore_all_settings()
@@ -867,6 +1015,8 @@ def main(argv=None) -> int:
         for port in ports():
             print(port.device, port.description)
         return 0
+    if a.auto:
+        return run_auto(list(sys.argv[1:] if argv is None else argv))
     screen = Screen(a.mock_image, a.display)
     device = None
     try:
@@ -914,10 +1064,10 @@ def main(argv=None) -> int:
         print(f'Mac84 v{BRIDGE_VERSION} bridge on', port, '| v0.3 USB protocol (+packed tiles) | default zoom 960x720'
               + (f' | ack window {a.ack_window}' if a.ack_window != 1 else ''), flush=True)
         print(f'Running from {Path(__file__).resolve().parents[1]}', flush=True)
-        print('Do not run Gemini84 bridge at the same time. Ctrl+C to stop.', flush=True)
+        print('Ctrl+C to stop.', flush=True)
         # SIGTERM should unwind the settings context, not leave modified preferences.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-        with SettingsProcess(not a.no_mac_settings and not a.link_test and a.mock_image is None) as settings, serial.Serial(port, 9600, timeout=2, write_timeout=20) as wire:
+        with SettingsProcess(not a.no_mac_settings and not a.link_test and a.mock_image is None) as settings, serial.Serial(port, 9600, timeout=2, write_timeout=20, exclusive=True) as wire:
             # The calculator might have sent HELLO before the Mac opened the
             # serial port, so send a proactive READY. Also answer later HELLOs.
             # The v0.3 calculator explicitly ignores duplicate READYs.

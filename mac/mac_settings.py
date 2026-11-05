@@ -15,7 +15,7 @@ import platform
 import signal
 import time
 import threading
-from mac_accessibility import AccessibilityUI, LABELS
+from mac_accessibility import AccessibilityUI, DirectSwitches, LABELS
 from settings_commands import run_command, check_cancelled, recovery_commands
 
 STATE_DIR = Path.home() / 'Library' / 'Application Support' / 'Mac84'
@@ -53,6 +53,45 @@ def _stored_switch_value(label):
         return None  # missing proves nothing
     value = value.strip().lower()
     return '1' if value in ('1', 'true', 'yes') else '0' if value in ('0', 'false', 'no') else None
+
+
+# Journal backends for the two Accessibility switches. 'direct' (v0.3.7) is
+# libAccessibility's setter; 'accessibility_ui' clicks System Settings.
+SWITCH_BACKENDS = ('accessibility_ui', 'direct')
+
+
+def _direct_switches():
+    """DirectSwitches, or None (missing library/symbols, or under unit tests)."""
+    try:
+        return DirectSwitches()
+    except (OSError, AttributeError, RuntimeError) as ex:
+        print(f'[settings] Direct switch control unavailable ({ex}); using System Settings.',
+              flush=True)
+        return None
+
+
+def _restore_switch_entries(backend, entries):
+    """Put switches back with one backend. Returns (restored, [(item, error)])."""
+    restored, failures = 0, []
+    for item in reversed(entries):
+        try:
+            current = backend.read(item['key'])
+            if current == item['original']:
+                continue
+            owned = [item['temporary'], item.get('previous_temporary')]
+            if current not in owned:
+                print(f'[settings] Preserved external change: {item["key"]}')
+                continue
+            actual = backend.set(item['key'], item['original'], current)
+            if actual == 'conflict':
+                print(f'[settings] Preserved external change: {item["key"]}')
+            elif actual != item['original']:
+                raise RuntimeError('UI verification failed for ' + item['key'])
+            else:
+                restored += 1
+        except Exception as ex:
+            failures.append((item, ex))
+    return restored, failures
 
 
 def _supports_ui():
@@ -205,7 +244,7 @@ def _restore_settings(journal=JOURNAL):
     problems = []
     restored = 0
     for item in reversed(entries):
-        if item.get('backend') == 'accessibility_ui':
+        if item.get('backend') in SWITCH_BACKENDS:
             continue
         domain, key = item['domain'], item['key']
         kind, original = item['kind'], item['original']
@@ -229,29 +268,26 @@ def _restore_settings(journal=JOURNAL):
         except Exception as ex:
             problems.append(str(ex))
     _refresh_clock()
-    ui_entries = [item for item in entries if item.get('backend') == 'accessibility_ui']
+    switch_entries = [item for item in entries if item.get('backend') in SWITCH_BACKENDS]
+    ui_entries = switch_entries
     ui_failures = []  # (item, error) for switches the UI could not restore
+    if any(item['backend'] == 'direct' for item in switch_entries):
+        direct = _direct_switches()
+        if direct is not None:
+            mine = [item for item in switch_entries
+                    if item['backend'] == 'direct' and direct.supports(item['key'])]
+            count, failed = _restore_switch_entries(direct, mine)
+            restored += count
+            for item, ex in failed:
+                print(f'[settings] {item["key"]}: direct restore failed ({ex}); trying System Settings.')
+            retry = {id(item) for item, _ in failed}
+            ui_entries = [item for item in switch_entries
+                          if not any(item is m for m in mine) or id(item) in retry]
     if ui_entries:
         try:
             with AccessibilityUI() as ui:
-                for item in reversed(ui_entries):
-                    try:
-                        current = ui.read(item['key'])
-                        if current == item['original']:
-                            continue
-                        owned = [item['temporary'], item.get('previous_temporary')]
-                        if current not in owned:
-                            print(f'[settings] Preserved external change: {item["key"]}')
-                            continue
-                        actual = ui.set(item['key'], item['original'], current)
-                        if actual == 'conflict':
-                            print(f'[settings] Preserved external change: {item["key"]}')
-                        elif actual != item['original']:
-                            raise RuntimeError('UI verification failed for ' + item['key'])
-                        else:
-                            restored += 1
-                    except Exception as ex:
-                        ui_failures.append((item, ex))
+                count, ui_failures = _restore_switch_entries(ui, ui_entries)
+                restored += count
         except Exception as ex:
             done = {id(item) for item, _ in ui_failures}
             ui_failures += [(item, ex) for item in ui_entries if id(item) not in done]
@@ -276,6 +312,8 @@ def _restore_settings(journal=JOURNAL):
     print(f'[settings] Recovery complete ({restored} preference changes restored).')
     if ui_entries:
         print('[settings] Accessibility switch restoration was checked through the UI.')
+    elif switch_entries:
+        print('[settings] Accessibility switch restoration was verified directly.')
 
 
 def restore_settings(journal=JOURNAL):
@@ -336,40 +374,30 @@ class MacSettings:
             check_cancelled()
             if _supports_ui():
                 print('[settings] Applying Accessibility > Display switches; USB remains active.', flush=True)
-                try:
-                    with AccessibilityUI() as ui:
-                        for label in LABELS:
-                            check_cancelled()
-                            try:
-                                current = ui.read(label)
-                                item = dict(backend='accessibility_ui', key=label,
-                                            original=current, temporary='1')
-                                records.append(item)
-                                _atomic_journal(self.journal, records)
-                                targets = ('0', '1') if current == '1' else ('1',)
-                                for target in targets:
-                                    item['previous_temporary'] = current
-                                    item['temporary'] = target
-                                    _atomic_journal(self.journal, records)
-                                    actual = ui.set(label, target, current)
-                                    if actual == 'conflict':
-                                        print(f'[settings] Preserved external change: {label}', flush=True)
-                                        records.remove(item)
-                                        _atomic_journal(self.journal, records)
-                                        break
-                                    if actual != target:
-                                        raise RuntimeError('Switch did not reach ' + target)
-                                    current = actual
-                                    item.pop('previous_temporary', None)
-                                    _atomic_journal(self.journal, records)
-                                    if target == '0':
-                                        time.sleep(.2)
-                                else:
-                                    print(f'[settings] {label}: ON (UI transition verified).', flush=True)
-                            except Exception as ex:
-                                _ui_warning(ex)
-                except Exception as ex:
-                    _ui_warning(ex)
+                direct = _direct_switches()
+                ui_labels = []
+                for label in LABELS:
+                    if direct is None or not direct.supports(label):
+                        ui_labels.append(label)
+                        continue
+                    check_cancelled()
+                    try:
+                        self._apply_switch(direct, 'direct', label, records)
+                    except Exception as ex:
+                        print(f'[settings] {label}: direct setting failed ({ex}); '
+                              'using System Settings.', flush=True)
+                        ui_labels.append(label)
+                if ui_labels:
+                    try:
+                        with AccessibilityUI() as ui:
+                            for label in ui_labels:
+                                check_cancelled()
+                                try:
+                                    self._apply_switch(ui, 'accessibility_ui', label, records)
+                                except Exception as ex:
+                                    _ui_warning(ex)
+                    except Exception as ex:
+                        _ui_warning(ex)
             else:
                 print('[settings] Automatic accessibility switches target macOS Sequoia 15.', flush=True)
             return self
@@ -385,6 +413,34 @@ class MacSettings:
                 self.lockfile.close()
                 self.lockfile = None
             raise
+
+    def _apply_switch(self, backend, backend_name, label, records):
+        """Turn one switch on, journaling before every change. A switch that
+        is already on is re-applied off then on, verifying each transition."""
+        current = backend.read(label)
+        item = dict(backend=backend_name, key=label, original=current, temporary='1')
+        records.append(item)
+        _atomic_journal(self.journal, records)
+        targets = ('0', '1') if current == '1' else ('1',)
+        for target in targets:
+            item['previous_temporary'] = current
+            item['temporary'] = target
+            _atomic_journal(self.journal, records)
+            actual = backend.set(label, target, current)
+            if actual == 'conflict':
+                print(f'[settings] Preserved external change: {label}', flush=True)
+                records.remove(item)
+                _atomic_journal(self.journal, records)
+                return
+            if actual != target:
+                raise RuntimeError('Switch did not reach ' + target)
+            current = actual
+            item.pop('previous_temporary', None)
+            _atomic_journal(self.journal, records)
+            if target == '0':
+                time.sleep(.2)
+        how = 'set directly, verified' if backend_name == 'direct' else 'UI transition verified'
+        print(f'[settings] {label}: ON ({how}).', flush=True)
 
     def __exit__(self, typ, val, tb):
         try:
