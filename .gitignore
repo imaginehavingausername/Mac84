@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# CEdev build intermediates (calculator/bin/MAC84.8xp itself is committed)
+calculator/obj/
+calculator/bin/*.map
+calculator/bin/*.obj
+calculator/bin/*.bin
+
+# Secrets and logs
+.env
+*.log
