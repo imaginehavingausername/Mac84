@@ -32,6 +32,8 @@ class ConversationWire:
         if data.startswith(b'F|'):
             count = int(data.split(b'|')[1])
             self.acks = (count+3)//4
+            # v0.3.4 coalesces writes: an empty batch is one 'F|0|m\nE\n' write.
+            if count == 0 and data.endswith(b'\nE\n'): self.frames += 1
         if data == b'E\n': self.frames += 1
         return len(data)
     def readline(self):

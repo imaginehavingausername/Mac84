@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mac84 v0.3.3 desktop mirroring USB bridge (independent of Gemini84).
+"""Mac84 v0.3.4 desktop mirroring USB bridge (independent of Gemini84).
 
 Local USB only. Captures the main macOS display, crops/resizes to 320x240,
 converts to RGB332 (256 colors), and sends only changed 16x16 tiles.
@@ -58,10 +58,72 @@ def rle_encode(block: bytes) -> bytes:
 
 
 
-def encode_tile(block: bytes) -> tuple[str, bytes]:
-    """Return smallest reversible representation; photos/text often defeat RLE."""
+def packed_bits(colors: int) -> int:
+    return 1 if colors <= 2 else 2 if colors <= 4 else 4
+
+
+def pack_tile(block: bytes) -> bytes:
+    """'Q' tile: [n][n palette bytes][256 indices at 1/2/4 bits, MSB first].
+
+    Antialiased text usually has 3..16 RGB332 colors per tile, where RLE fails
+    and raw costs 256 bytes; packed costs 34..145 bytes."""
+    palette = sorted(set(block))
+    if len(palette) > 16:
+        raise ValueError('Packed tiles support at most 16 colors')
+    bits = packed_bits(len(palette))
+    table = bytearray(256)
+    for index, color in enumerate(palette):
+        table[color] = index
+    idx = block.translate(bytes(table))
+    if bits == 4:
+        body = bytes((idx[i] << 4) | idx[i + 1] for i in range(0, 256, 2))
+    elif bits == 2:
+        body = bytes((idx[i] << 6) | (idx[i + 1] << 4) | (idx[i + 2] << 2) | idx[i + 3]
+                     for i in range(0, 256, 4))
+    else:
+        body = bytes(sum(idx[i + k] << (7 - k) for k in range(8)) for i in range(0, 256, 8))
+    return bytes((len(palette),)) + bytes(palette) + body
+
+
+def unpack_tile(packet: bytes) -> bytes:
+    """Reference decoder for tests; mirrors the calculator's decode."""
+    colors = packet[0]
+    if not 1 <= colors <= 16:
+        raise ValueError('Malformed packed tile: color count')
+    bits = packed_bits(colors)
+    if len(packet) != 1 + colors + 32 * bits:
+        raise ValueError('Malformed packed tile: length')
+    palette, body, out = packet[1:1 + colors], packet[1 + colors:], bytearray()
+    for byte in body:
+        for shift in range(8 - bits, -1, -bits):
+            index = (byte >> shift) & ((1 << bits) - 1)
+            if index >= colors:
+                raise ValueError('Malformed packed tile: index')
+            out.append(palette[index])
+    return bytes(out)
+
+
+def encode_tile(block: bytes, packed: bool = False) -> tuple[str, bytes]:
+    """Return smallest reversible representation; photos/text often defeat RLE.
+
+    packed=True only after the calculator advertised support (@M84|5)."""
     encoded = rle_encode(block)
-    return ('R', encoded) if len(encoded) < len(block) else ('P', block)
+    best = ('R', encoded) if len(encoded) < len(block) else ('P', block)
+    if packed:
+        colors = len(set(block))
+        if colors <= 16 and 1 + colors + 32 * packed_bits(colors) < len(best[1]):
+            best = ('Q', pack_tile(block))
+    return best
+
+
+def decode_tile(fmt: str, packet: bytes) -> bytes:
+    if fmt == 'P':
+        return packet
+    if fmt == 'R':
+        return rle_decode(packet)
+    if fmt == 'Q':
+        return unpack_tile(packet)
+    raise ValueError(f'Unknown tile format {fmt!r}')
 
 def rle_decode(packet: bytes, expected: int = TILE * TILE) -> bytes:
     if len(packet) % 2:
@@ -231,31 +293,101 @@ class MacInput:
                                              max(-20, min(20, lines)))
         q.CGEventPost(q.kCGHIDEventTap, ev)
 
+    CONTROL, COMMAND = 59, 55  # left modifier key codes
+
+    def key_combo(self, key: int, modifiers: tuple[int, ...] = ()):
+        """Press key with modifiers held, releasing every modifier even if
+        posting fails part way. Uses the same explicit modifier down/up
+        sequence as the working v0.3.2 Space switching."""
+        if self.dry_run:
+            return
+        q = self.quartz
+        masks = {self.CONTROL: q.kCGEventFlagMaskControl,
+                 self.COMMAND: q.kCGEventFlagMaskCommand}
+        flags = 0
+        held = []
+        try:
+            for mod in modifiers:
+                flags |= masks[mod]
+                ev = q.CGEventCreateKeyboardEvent(None, mod, True)
+                q.CGEventSetFlags(ev, flags)
+                q.CGEventPost(q.kCGHIDEventTap, ev)
+                held.append(mod)
+            for down in (True, False):
+                ev = q.CGEventCreateKeyboardEvent(None, key, down)
+                q.CGEventSetFlags(ev, flags)
+                q.CGEventPost(q.kCGHIDEventTap, ev)
+                time.sleep(.015)
+        finally:
+            for mod in reversed(held):
+                flags &= ~masks[mod]
+                ev = q.CGEventCreateKeyboardEvent(None, mod, False)
+                q.CGEventSetFlags(ev, flags)
+                q.CGEventPost(q.kCGHIDEventTap, ev)
+
     def switch_space(self, direction: str):
         """macOS's standard Control+Left/Right action, including full-screen Spaces."""
         if direction not in ('L', 'R'):
             raise ValueError('Invalid Space direction')
+        self.key_combo(123 if direction == 'L' else 124, (self.CONTROL,))
+
+    def show_windows(self, app_only: bool = False):
+        """Mission Control (Control+Up) or App Expose (Control+Down): the
+        default shortcuts, same family as Control+Left/Right. Press again to
+        close, or click a window with TRACE to switch to it."""
+        self.key_combo(125 if app_only else 126, (self.CONTROL,))
+
+    def double_click(self, px: float, py: float):
         if self.dry_run:
             return
         q = self.quartz
-        key = 123 if direction == 'L' else 124
-        # Send explicit modifier down/up and release it even if posting fails.
-        control_down = False
-        try:
-            ev = q.CGEventCreateKeyboardEvent(None, 59, True)
-            q.CGEventSetFlags(ev, q.kCGEventFlagMaskControl)
-            q.CGEventPost(q.kCGHIDEventTap, ev)
-            control_down = True
-            for down in (True, False):
-                ev = q.CGEventCreateKeyboardEvent(None, key, down)
-                q.CGEventSetFlags(ev, q.kCGEventFlagMaskControl)
-                q.CGEventPost(q.kCGHIDEventTap, ev)
-                time.sleep(.015)
-        finally:
-            if control_down:
-                ev = q.CGEventCreateKeyboardEvent(None, 59, False)
-                q.CGEventSetFlags(ev, 0)
-                q.CGEventPost(q.kCGHIDEventTap, ev)
+        point = self.to_mac_points(px, py)
+        # macOS recognises a double click by click state 1 then 2.
+        for state in (1, 2):
+            for typ in (q.kCGEventLeftMouseDown, q.kCGEventLeftMouseUp):
+                event = q.CGEventCreateMouseEvent(None, typ, point, q.kCGMouseButtonLeft)
+                q.CGEventSetIntegerValueField(event, q.kCGMouseEventClickState, state)
+                q.CGEventPost(q.kCGHIDEventTap, event)
+                time.sleep(.02)
+
+    def owner_at(self, point: tuple[float, float]) -> Optional[str]:
+        """App owning the frontmost on-screen window under point (Quartz only,
+        no AppKit, so Python never becomes a visible app)."""
+        q = self.quartz
+        windows = q.CGWindowListCopyWindowInfo(q.kCGWindowListOptionOnScreenOnly,
+                                               q.kCGNullWindowID) or ()
+        x, y = point
+        for info in windows:  # front to back
+            bounds = info.get(q.kCGWindowBounds) or {}
+            if info.get(q.kCGWindowAlpha, 1) == 0:
+                continue
+            bx, by = bounds.get('X', 0), bounds.get('Y', 0)
+            if bx <= x < bx + bounds.get('Width', 0) and by <= y < by + bounds.get('Height', 0):
+                return str(info.get(q.kCGWindowOwnerName) or '')
+        return None
+
+    def look_up(self, px: float, py: float) -> str:
+        """Three-finger-tap equivalent. Over Finder (windows or desktop icons):
+        select the item and press Space for Quick Look; press Y= again to close
+        (Escape - harmless if focus has moved on, unlike a second Space).
+        Elsewhere: Control+Command+D, Look Up for the word under the pointer,
+        which never clicks (so links are not followed)."""
+        if self.dry_run:
+            return 'dry run'
+        point = self.to_mac_points(px, py)
+        if getattr(self, '_quick_look_open', False):
+            self._quick_look_open = False
+            self.key_combo(53)  # Escape closes Quick Look
+            return 'closed Quick Look'
+        self.move(px, py)
+        if self.owner_at(point) == 'Finder':
+            self.click('L', px, py)
+            time.sleep(.06)
+            self.key_combo(49)
+            self._quick_look_open = True
+            return 'Quick Look (Finder)'
+        self.key_combo(2, (self.CONTROL, self.COMMAND))  # kVK_ANSI_D
+        return 'Look Up'
 
     def type_text(self, message: str):
         if self.dry_run:
@@ -301,6 +433,17 @@ class ViewSession:
         self.latest_frame_changes = 0
         self.next_tile = 0
         self.batches_sent = 0
+        self.packed_tiles = False   # enabled only by the calculator's @M84|5
+        self.ack_window = 1         # ACK groups in flight; 1 = proven behaviour
+        self.synced = True          # last batch emptied the change list
+        self.restart_from_top()
+
+    def restart_from_top(self):
+        # A new pass over a mostly changed screen draws top-to-bottom. The
+        # rotating start is kept only while a pass is still unfinished, which is
+        # what prevents top-row animation from starving the lower screen.
+        self.next_tile = 0
+        self.synced = True
 
     def zoom_by(self, delta: int):
         new_index = max(0, min(len(ZOOM_MODES) - 1, self.zoom + delta))
@@ -308,6 +451,7 @@ class ViewSession:
             self.zoom = new_index
             self.old_tiles.clear()
             self.pending.clear()
+            self.restart_from_top()
 
     def pan(self, dx: int, dy: int):
         geo = self.current_geometry
@@ -317,6 +461,7 @@ class ViewSession:
         self.center_y += dy * geo.crop_h / HEIGHT
         self.old_tiles.clear()
         self.pending.clear()
+        self.restart_from_top()
 
     def render(self) -> tuple[list[tuple[int, int, str, bytes, bytes]], Geometry, bool]:
         """Recheck the desktop at every batch boundary; keep only latest pixels.
@@ -333,17 +478,22 @@ class ViewSession:
         output, geometry = crop_view(raw, self.zoom, self.center_x, self.center_y)
         self.current_geometry = geometry
         pixels = rgb332_image(output)
+        if self.synced:
+            # The previous pass finished: start this one at the top instead of
+            # wherever the last small update happened to end (v0.3.3 quirk).
+            self.next_tile = 0
         changed = []
         for offset in range(COLS * ROWS):
             index = (self.next_tile + offset) % (COLS * ROWS)
             tx, ty = index % COLS, index // COLS
             block = tile_at(pixels, tx, ty)
             if self.old_tiles.get((tx, ty)) != block:
-                fmt, packed = encode_tile(block)
+                fmt, packed = encode_tile(block, self.packed_tiles)
                 changed.append((tx, ty, fmt, packed, block))
         batch = changed[:self.patches_per_frame]
         self.pending = changed[self.patches_per_frame:]
         self.latest_frame_changes = len(changed)
+        self.synced = not self.pending
         if batch:
             tx, ty = batch[-1][:2]
             self.next_tile = (ty * COLS + tx + 1) % (COLS * ROWS)
@@ -366,48 +516,67 @@ def write_paced(wire, payload: bytes, pace: float):
             time.sleep(pace)
 
 
+def _read_ack(wire, session: ViewSession, where: str):
+    try:
+        ack = wire.readline()
+    except OSError as exc:  # pyserial's SerialException is an OSError
+        raise RuntimeError(
+            f'Calculator USB link vanished while waiting for an ACK ({where}): {exc}. '
+            'MAC84 stopped first; its screen should show the reason '
+            '(v0.3.3+). Note that message before pressing CLEAR.') from exc
+    if ack != b'A\n':
+        raise RuntimeError(f'ACK failure ({where}): got {ack!r} '
+                           f'(empty means no reply within the 2 s timeout). '
+                           'Check the calculator screen for the reason; restart MAC84.')
+
+
 def send_frame(wire, session: ViewSession, pace: float = .003, log=False):
+    """Send one batch. Each ACK group (<= 4 tiles) is written as ONE paced
+    stream of headers + payloads, so small tiles share 48-byte chunks and no
+    header needs its own flushed write. The byte rate per chunk is unchanged.
+
+    session.ack_window = 1 waits for each group's ACK before sending the next
+    (the proven v0.3 behaviour). 2 lets one more group be in flight; the
+    calculator protocol is identical either way."""
     started = time.monotonic()
     changes, _, more = session.render()
     session.batches_sent += 1
     batch = session.batches_sent
+    rendered = time.monotonic()
     if log:
-        print(f'Batch {batch}: {len(changes)} tiles, more={int(more)}, '
-              f'capture+encode {1000 * (time.monotonic() - started):.0f} ms, '
+        kinds = ''.join(sorted(set(c[2] for c in changes)))
+        print(f'Batch {batch}: {len(changes)} tiles [{kinds}], more={int(more)}, '
+              f'capture+encode {1000 * (rendered - started):.0f} ms, '
               f'{len(session.old_tiles)}/{COLS * ROWS} tiles confirmed', flush=True)
-    wire.write(f'F|{len(changes)}|{int(more)}\n'.encode('ascii'))
-    wire.flush()
+    stream = bytearray(f'F|{len(changes)}|{int(more)}\n'.encode('ascii'))
+    window = max(1, int(session.ack_window))
+    in_flight = []  # [(where, [(tx, ty, block), ...])], oldest first
+    group = []
     sent = 0
-    unconfirmed = []
     for index, (tx, ty, fmt, packet, block) in enumerate(changes):
-        wire.write(f'T|{tx}|{ty}|{fmt}|{len(packet)}\n'.encode('ascii'))
-        wire.flush()
-        write_paced(wire, packet, pace)
-        unconfirmed.append((tx, ty, block))
-        # The calculator ACKs a GROUP of up to four tiles, not each tile.
-        # A short group bounds buffering while removing most round trips.
-        if (index + 1) % ACK_GROUP == 0 or index + 1 == len(changes):
-            where = (f'batch {batch}, tile {index + 1} of {len(changes)} at ({tx},{ty}); '
-                     f'{len(session.old_tiles)}/{COLS * ROWS} tiles confirmed before this group')
-            try:
-                ack = wire.readline()
-            except OSError as exc:  # pyserial's SerialException is an OSError
-                raise RuntimeError(
-                    f'Calculator USB link vanished while waiting for an ACK ({where}): {exc}. '
-                    'MAC84 stopped first; its screen should show the reason '
-                    '(v0.3.3+). Note that message before pressing CLEAR.') from exc
-            if ack != b'A\n':
-                raise RuntimeError(f'ACK failure ({where}): got {ack!r} '
-                                   f'(empty means no reply within the 2 s timeout). '
-                                   'Check the calculator screen for the reason; restart MAC84.')
-            for cx, cy, confirmed in unconfirmed:
-                session.ack_tile(cx, cy, confirmed)
-            unconfirmed.clear()
+        stream += f'T|{tx}|{ty}|{fmt}|{len(packet)}\n'.encode('ascii')
+        stream += packet
+        group.append((tx, ty, block))
         sent += len(packet)
-    wire.write(b'E\n')
-    wire.flush()
+        # The calculator ACKs a GROUP of up to four tiles, not each tile.
+        if (index + 1) % ACK_GROUP == 0 or index + 1 == len(changes):
+            write_paced(wire, bytes(stream), pace)
+            stream.clear()
+            in_flight.append((f'batch {batch}, tile {index + 1} of {len(changes)} at ({tx},{ty}); '
+                              f'{len(session.old_tiles)}/{COLS * ROWS} tiles confirmed before this group',
+                              group))
+            group = []
+            while len(in_flight) >= window or (in_flight and index + 1 == len(changes)):
+                where, confirmed = in_flight.pop(0)
+                _read_ack(wire, session, where)
+                for cx, cy, block_bytes in confirmed:
+                    session.ack_tile(cx, cy, block_bytes)
+    stream += b'E\n'
+    write_paced(wire, bytes(stream), pace)
     if log and changes:
-        print(f'Batch complete: {sent} bytes', flush=True)
+        elapsed = time.monotonic() - rendered
+        print(f'Batch {batch} complete: {sent:,} payload bytes in {1000 * elapsed:.0f} ms '
+              f'({sent / max(elapsed, 1e-6) / 1024:.1f} KB/s)', flush=True)
 
 
 def parse_request(wire, session: ViewSession, input_dev: MacInput,
@@ -415,12 +584,20 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
                   link_test: bool = False):
     fields = message.split('|')
     command = fields[0]
-    if message in ('@M84', '@M84|4'):
+    if message in ('@M84', '@M84|4', '@M84|5'):
         session.old_tiles.clear()
         session.pending.clear()
-        session.next_tile = 0
-        wire.write(b'@M84READY|4\n' if message.endswith('|4') else b'@M84READY\n')
+        session.restart_from_top()
+        # |5 = v0.3.4 calculator: understands packed 'Q' tiles. Older greetings
+        # keep the original raw/RLE tiles, so mixed versions still work.
+        session.packed_tiles = message == '@M84|5'
+        reply = {'@M84': b'@M84READY\n', '@M84|4': b'@M84READY|4\n',
+                 '@M84|5': b'@M84READY|5\n'}[message]
+        wire.write(reply)
         wire.flush()
+        if log:
+            print(f'[usb] Calculator greeting {message}; packed tiles '
+                  f'{"on" if session.packed_tiles else "off"}', flush=True)
         return
     if command == 'V' and len(fields) == 1:
         if link_test:
@@ -453,12 +630,29 @@ def parse_request(wire, session: ViewSession, input_dev: MacInput,
             if point is not None:
                 input_dev.move(*point)
             return
-        if command == 'C' and len(fields) == 4 and fields[1] in ('L', 'R'):
+        if command == 'C' and len(fields) == 4 and fields[1] in ('L', 'R', 'D'):
             x, y = map(int, fields[2:])
             point = session.view_to_point(x, y)
             if point is not None:
-                input_dev.click(fields[1], *point)
+                if fields[1] == 'D':
+                    input_dev.double_click(*point)
+                else:
+                    input_dev.click(fields[1], *point)
             return
+    if command == 'L' and len(fields) == 3:
+        # Y=: what a three-finger tap does - Quick Look on Finder items,
+        # Look Up (dictionary/data detectors) elsewhere.
+        point = session.view_to_point(int(fields[1]), int(fields[2]))
+        if point is not None:
+            what = input_dev.look_up(*point)
+            if log:
+                print(f'[input] Y= at pointer: {what}', flush=True)
+        return
+    if command == 'X' and len(fields) == 2 and fields[1] in ('M', 'A'):
+        # WINDOW: Mission Control (all windows). 2ND+WINDOW: App Expose.
+        input_dev.show_windows(fields[1] == 'A')
+        session.pending.clear()
+        return
     if command == 'S' and len(fields) == 2 and fields[1] in ('L', 'R'):
         input_dev.switch_space(fields[1])
         session.pending.clear()
@@ -501,6 +695,8 @@ def main(argv=None) -> int:
     p.add_argument('--preview', type=Path, help='Save current zoom view as PNG without USB')
     p.add_argument('--pace', type=float, default=.003, help='Delay after every 48 bytes over USB')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--ack-window', type=int, default=1, choices=(1, 2),
+                   help='EXPERIMENTAL: tile groups in flight before waiting for an ACK (default 1)')
     p.add_argument('--benchmark', action='store_true', help='Analyze one frame; no USB or input control')
     p.add_argument('--no-mac-settings', action='store_true', help='Do not adjust/restore macOS defaults')
     p.add_argument('--restore-settings', action='store_true', help='Recover settings after a previous crash')
@@ -517,19 +713,31 @@ def main(argv=None) -> int:
     screen = Screen(a.mock_image, a.display)
     try:
         session = ViewSession(screen)
+        session.ack_window = a.ack_window
         if a.benchmark:
             screenshot = screen.capture()
             view, geo = crop_view(screenshot, ZOOM_DEFAULT, screenshot.width / 2,
                                   screenshot.height / 2)
             pixels = rgb332_image(view)
-            packets = [encode_tile(tile_at(pixels, x, y))[1] for y in range(ROWS)
-                       for x in range(COLS)]
-            payload = sum(map(len, packets))
-            estimated_pacing = sum((len(packet) + 47) // 48 for packet in packets) * a.pace
+            blocks = [(x, y, tile_at(pixels, x, y)) for y in range(ROWS) for x in range(COLS)]
             print(f'Source: {screenshot.width}x{screenshot.height}  Zoom #2: {geo.crop_w}x{geo.crop_h}')
-            print(f'Tiles: {len(packets)}  raw 8-bit: {len(pixels):,} bytes')
-            print(f'Compressed pixel payload: {payload:,} bytes')
-            print(f'Mac write pacing alone: {estimated_pacing:.1f}s; actual USB/hardware can be slower')
+            print(f'Tiles: {len(blocks)}  raw 8-bit: {len(pixels):,} bytes')
+            for label, packed, grouped in (('v0.3.3 (raw/RLE, header per write)', False, False),
+                                           ('v0.3.4 (raw/RLE/packed, grouped)', True, True)):
+                tiles = [(x, y) + encode_tile(block, packed) for x, y, block in blocks]
+                payload = sum(len(t[3]) for t in tiles)
+                if grouped:
+                    chunks = 0
+                    for start in range(0, len(tiles), ACK_GROUP):
+                        size = sum(len(f'T|{x}|{y}|{f}|{len(d)}\n') + len(d)
+                                   for x, y, f, d in tiles[start:start + ACK_GROUP])
+                        chunks += (size + 47) // 48
+                else:
+                    chunks = sum((len(d) + 47) // 48 for *_, d in tiles)
+                kinds = {k: sum(1 for t in tiles if t[2] == k) for k in 'PRQ'}
+                print(f'{label}: payload {payload:,} B, {chunks} paced chunks -> '
+                      f'{chunks * a.pace:.2f}s of pacing  tiles {kinds}')
+            print('Pacing is a lower bound; USB, ACK round trips and calculator drawing add to it.')
             return 0
         if a.preview:
             screenshot = screen.capture()
@@ -545,7 +753,8 @@ def main(argv=None) -> int:
             raise RuntimeError('pyserial missing: pip install pyserial')
         device = DeferredMacInput(session, dry_run=a.mock_image is not None or a.link_test)
         port = select_port(a.port)
-        print('Mac84 v0.3.3 bridge on', port, '| v0.3 USB protocol | default zoom 960x720', flush=True)
+        print('Mac84 v0.3.4 bridge on', port, '| v0.3 USB protocol (+packed tiles) | default zoom 960x720'
+              + (f' | ack window {a.ack_window}' if a.ack_window != 1 else ''), flush=True)
         print('Do not run Gemini84 bridge at the same time. Ctrl+C to stop.', flush=True)
         # SIGTERM should unwind the settings context, not leave modified preferences.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

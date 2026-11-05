@@ -84,6 +84,33 @@ int main(void) {
     key(6, kb_Clear, false);
     assert(sent_count == before_spaces + 8);
     assert(!memcmp(sent + before_spaces, "S|L\nS|R\n", 8));
+    /* v0.3.4 top row: ZOOM double click, Y= look, WINDOW / 2ND+WINDOW. */
+    {
+        size_t before_top = sent_count;
+        const char *expect = "C|D|160|120\nL|160|120\nX|M\nX|A\n";
+        key(1, kb_Zoom, false);
+        key(1, kb_Yequ, false);
+        key(1, kb_Window, false);
+        key(1, kb_Window, true);
+        assert(sent_count - before_top == strlen(expect));
+        assert(!memcmp(sent + before_top, expect, strlen(expect)));
+    }
+    /* Packed tile decode: 3 colors at 2 bits; out-of-range index rejected. */
+    {
+        int i;
+        memset(packet, 0, sizeof(packet));
+        packet[0] = 3; packet[1] = 10; packet[2] = 20; packet[3] = 30;
+        for (i = 0; i < 64; ++i) packet[4 + i] = 0x24; /* 00 10 01 00 */
+        typing = false;
+        assert(draw_tile(2, 3, 'Q', 68));
+        assert(gfx_vbuffer[48][32] == 10 && gfx_vbuffer[48][33] == 30 &&
+               gfx_vbuffer[48][34] == 20 && gfx_vbuffer[63][47] == 10);
+        packet[4] = 0xC0; /* index 3 with only 3 colors */
+        assert(!draw_tile(2, 3, 'Q', 68));
+        assert(!draw_tile(2, 3, 'Q', 67)); /* wrong length */
+        assert(tile_header("T|19|14|Q|145", &i, &i, (char *)packet, &i));
+        assert(!tile_header("T|19|14|Q|146", &i, &i, (char *)packet, &i));
+    }
     key(2, kb_Alpha, false);
     /* Sequential 2ND, release, MODE is accepted, not only a held chord. */
     memset(prev_keys, 0, sizeof(prev_keys));

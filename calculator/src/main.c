@@ -1,5 +1,5 @@
 /*
- * MAC84 v0.3.3 — TI-84 Plus CE native USB desktop viewer.
+ * MAC84 v0.3.4 — TI-84 Plus CE native USB desktop viewer.
  * Mac -> TI: F|n|more\n, followed by T|x|y|P/R|len\n + len binary bytes per tile, E\n.
  * TI -> Mac: V\n requests up to 36 dirty 16x16 tiles.
  * The TI returns A\n after each group of four tiles or the final shorter group.
@@ -136,20 +136,30 @@ static bool send_line(const char *line) {
     return send_bytes(line, strlen(line));
 }
 
-/* Read exactly one byte so a following binary packet cannot be swallowed
-   by the line parser. USB events must be pumped while waiting. */
-static bool recv_byte(uint8_t *result, clock_t deadline) {
+/* v0.3.4: small receive buffer. Lines and binary payloads are both served
+   from it, so nothing is "swallowed" between a header and its packet, and a
+   header byte no longer costs a USB poll + key scan + 1-byte srl_Read. */
+static uint8_t rx_buf[128];
+static uint8_t rx_pos = 0, rx_len = 0;
+
+static bool rx_refill(clock_t deadline) {
     while (clock() < deadline) {
         int n;
         usb_poll();
         scan_controls();
         if (quit_requested) return false;
         if (link_lost) { fail("USB link lost while reading"); return false; }
-        n = srl_Read(&srl, result, 1);
-        if (n == 1) return true;
+        n = srl_Read(&srl, rx_buf, sizeof(rx_buf));
+        if (n > 0) { rx_pos = 0; rx_len = (uint8_t)n; return true; }
         if (n < 0) { fail_code("srl_Read error", n); return false; }
     }
     return false;
+}
+
+static bool recv_byte(uint8_t *result, clock_t deadline) {
+    if (rx_pos >= rx_len && !rx_refill(deadline)) return false;
+    *result = rx_buf[rx_pos++];
+    return true;
 }
 
 static bool recv_line(char *out, size_t capacity, int seconds) {
@@ -181,6 +191,14 @@ static bool recv_line(char *out, size_t capacity, int seconds) {
 static bool recv_exact(uint8_t *buf, size_t size, int seconds) {
     clock_t deadline = clock() + (clock_t)seconds * CLOCKS_PER_SEC;
     size_t got = 0;
+    /* Bytes already buffered behind the header come first. */
+    if (rx_pos < rx_len) {
+        size_t take = (size_t)(rx_len - rx_pos);
+        if (take > size) take = size;
+        memcpy(buf, rx_buf + rx_pos, take);
+        rx_pos = (uint8_t)(rx_pos + take);
+        got = take;
+    }
     while (got < size && clock() < deadline) {
         int n;
         usb_poll();
@@ -261,7 +279,9 @@ static void send_click(char which) {
     send_line(command);
 }
 
-/* Header T|x|y|P_or_R|len; P = raw 256 bytes, R = RGB332 RLE. */
+/* Header T|x|y|kind|len. P = raw 256 bytes, R = RGB332 RLE pairs,
+   Q = packed: [n][n palette bytes][256 indices at 1/2/4 bits, MSB first]
+   (Q only after the Mac answered @M84READY|5). */
 static bool tile_header(const char *line, int *tx, int *ty, char *kind, int *len) {
     char *end;
     long x, y, n;
@@ -269,43 +289,63 @@ static bool tile_header(const char *line, int *tx, int *ty, char *kind, int *len
     x = strtol(line + 2, &end, 10);
     if (*end++ != '|') return false;
     y = strtol(end, &end, 10);
-    if (*end++ != '|' || !(*end == 'R' || *end == 'P')) return false;
+    if (*end++ != '|' || !(*end == 'R' || *end == 'P' || *end == 'Q')) return false;
     *kind = *end++;
     if (*end++ != '|') return false;
     n = strtol(end, &end, 10);
     if (*end != 0 || x < 0 || x >= 20 || y < 0 || y >= 15 || n < 2 ||
         n > MAX_TILE_PACKET || (*kind == 'R' && (n & 1)) ||
-        (*kind == 'P' && n != 256)) return false;
+        (*kind == 'P' && n != 256) ||
+        (*kind == 'Q' && (n < 1 + 1 + 32 || n > 1 + 16 + 128))) return false;
     *tx = (int)x; *ty = (int)y; *len = (int)n;
     return true;
 }
 
-static bool draw_tile(int tx, int ty, char kind, int packet_len) {
+static uint8_t tile_px[TILE * TILE];
+
+/* Decode fully (and validate) before touching the screen, so a bad packet
+   never leaves a half-drawn tile. */
+static const uint8_t *decode_tile(char kind, int packet_len) {
     int i, pixel = 0;
+    if (kind == 'P') return packet;
     if (kind == 'R') {
         for (i = 0; i < packet_len; i += 2) {
             int run = packet[i];
-            if (!run || pixel + run > TILE * TILE) return false;
+            if (!run || pixel + run > TILE * TILE) return NULL;
+            memset(tile_px + pixel, packet[i + 1], (size_t)run);
             pixel += run;
         }
-        if (pixel != TILE * TILE) return false;
-        pixel = 0;
-        for (i = 0; i < packet_len; i += 2) {
-            int run = packet[i], color = packet[i + 1], j;
-            for (j = 0; j < run; ++j, ++pixel) {
-                int x = tx * TILE + (pixel & 15);
-                int y = ty * TILE + (pixel >> 4);
-                if (!typing || y < OVERLAY_Y)
-                    gfx_vbuffer[y][x] = (uint8_t)color;
+        return pixel == TILE * TILE ? tile_px : NULL;
+    }
+    {
+        int colors = packet[0], bits, shift;
+        const uint8_t *palette = packet + 1, *src;
+        uint8_t mask;
+        if (colors < 1 || colors > 16) return NULL;
+        bits = colors <= 2 ? 1 : colors <= 4 ? 2 : 4;
+        if (packet_len != 1 + colors + 32 * bits) return NULL;
+        mask = (uint8_t)((1 << bits) - 1);
+        src = packet + 1 + colors;
+        while (pixel < TILE * TILE) {
+            uint8_t byte = *src++;
+            for (shift = 8 - bits; shift >= 0; shift -= bits) {
+                uint8_t index = (uint8_t)((byte >> shift) & mask);
+                if (index >= colors) return NULL;
+                tile_px[pixel++] = palette[index];
             }
         }
-    } else {
-        for (pixel = 0; pixel < 256; pixel++) {
-            int x = tx * TILE + (pixel & 15);
-            int y = ty * TILE + (pixel >> 4);
-            if (!typing || y < OVERLAY_Y)
-                gfx_vbuffer[y][x] = packet[pixel];
-        }
+        return tile_px;
+    }
+}
+
+static bool draw_tile(int tx, int ty, char kind, int packet_len) {
+    const uint8_t *src = decode_tile(kind, packet_len);
+    int row, x = tx * TILE, y = ty * TILE;
+    if (!src) return false;
+    /* One 16-byte copy per row instead of 256 indexed pixel writes. */
+    for (row = 0; row < TILE; ++row, ++y) {
+        if (typing && y >= OVERLAY_Y) break;
+        memcpy(&gfx_vbuffer[y][x], src + row * TILE, TILE);
     }
     return true;
 }
@@ -333,7 +373,7 @@ static bool fetch_frame(void) {
     stage = "waiting for batch header";
     for (i = 0; i < 40; ++i) {
         if (!recv_line(line, sizeof(line), 8)) return false;
-        if (!strcmp(line, "@M84READY")) continue;
+        if (!strncmp(line, "@M84READY", 9)) continue;  /* any version's reply */
         if (line[0] == 'F' && line[1] == '|') break;
         note_bad_line(line);
         fail("Unexpected line, wanted F|");
@@ -364,7 +404,10 @@ static bool fetch_frame(void) {
         }
         stage = "receiving tile data";
         if (!recv_exact(packet, (size_t)len, 8)) return false;
-        if (!draw_tile(tx, ty, kind, len)) { fail("Bad RLE tile data"); return false; }
+        if (!draw_tile(tx, ty, kind, len)) {
+            fail(kind == 'Q' ? "Bad packed tile data" : "Bad RLE tile data");
+            return false;
+        }
         /* The host sends groups of 4 tiles before waiting for an ACK. */
         if ((i + 1) % ACK_GROUP == 0 || i + 1 == total) {
             stage = "sending ACK";
@@ -612,7 +655,7 @@ static void show_stop_screen(void) {
     gfx_FillRectangle_NoClip(0, 166, 320, 2);
     gfx_SetTextBGColor(255);
     gfx_SetTextFGColor(224);
-    gfx_PrintStringXY("MAC84 v0.3.3 STOPPED", 4, y); y += 14;
+    gfx_PrintStringXY("MAC84 v0.3.4 STOPPED", 4, y); y += 14;
     gfx_SetTextFGColor(0);
     gfx_PrintStringXY(fail_reason[0] ? fail_reason : "No reason recorded", 4, y); y += 12;
     snprintf(text, sizeof(text), "While: %s", stage);
@@ -679,8 +722,18 @@ static void remote_keys(void) {
             send_cursor_position();
         }
     }
+    /* Top row, left to right: Y= look, WINDOW windows, ZOOM double, TRACE
+       left, GRAPH right. */
     if (hotkey(1, kb_Trace)) { send_click('L'); force_refresh = true; }
     if (hotkey(1, kb_Graph)) { send_click('R'); force_refresh = true; }
+    if (hotkey(1, kb_Zoom)) { send_click('D'); force_refresh = true; }
+    if (hotkey(1, kb_Yequ)) {
+        char cmd[24];
+        snprintf(cmd, sizeof(cmd), "L|%d|%d\n", cursor_x, cursor_y);
+        send_line(cmd);
+        force_refresh = true;
+    }
+    if (hotkey(1, kb_Window)) { send_line(pan ? "X|A\n" : "X|M\n"); force_refresh = true; }
     if (hotkey(6, kb_Power)) { send_line("W|3\n"); force_refresh = true; }
     if (hotkey(6, kb_Div)) { send_line("W|-3\n"); force_refresh = true; }
     if (hotkey(6, kb_Add)) {
@@ -706,7 +759,7 @@ int main(void) {
     palette_init();
     gfx_FillScreen(255);
     gfx_SetTextFGColor(0);
-    gfx_PrintStringXY("MAC84 v0.3.3 - DIAGNOSTIC STOPS", 4, 6);
+    gfx_PrintStringXY("MAC84 v0.3.4", 4, 6);
     gfx_PrintStringXY("Waiting for USB...", 4, 22);
     if (usb_Init(usb_callback, NULL,
                  srl_GetCDCStandardDescriptors(), USB_DEFAULT_INIT_FLAGS) != USB_SUCCESS) {
@@ -734,12 +787,12 @@ int main(void) {
     stage = "handshake";
     for (i = 0; i < 40; ++i) {
         fail_reason[0] = 0;  /* a retry timeout is expected here, not a cause */
-        if (!send_line("@M84\n")) {
+        if (!send_line("@M84|5\n")) {
             gfx_PrintStringXY("USB write failed", 4, 54);
             gfx_PrintStringXY(fail_reason, 4, 70);
             goto wait_for_exit;
         }
-        if (recv_line(line, sizeof(line), 2) && !strcmp(line, "@M84READY")) {
+        if (recv_line(line, sizeof(line), 2) && !strncmp(line, "@M84READY", 9)) {
             online = true;
             break;
         }
@@ -749,6 +802,13 @@ int main(void) {
     if (!online) {
         gfx_PrintStringXY("No bridge after 80 sec", 4, 54);
         goto wait_for_exit;
+    }
+    /* A plain @M84READY may be the bridge's proactive port-open READY, sent
+       before it saw our greeting. Repeat the greeting so a v0.3.4 bridge
+       enables packed tiles; an older bridge just logs and ignores it. */
+    if (strcmp(line, "@M84READY|5") && !send_line("@M84|5\n")) {
+        show_stop_screen();
+        goto cleanup_serial;
     }
     gfx_FillScreen(255);
     cursor_show();

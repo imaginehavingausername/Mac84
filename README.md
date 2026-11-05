@@ -1,13 +1,14 @@
 # Mac84
 
 **Control your Mac from a TI-84 Plus CE.** Mac84 mirrors your Mac's screen onto the
-calculator over USB. From the calculator keypad you can move the pointer, click,
-scroll, zoom and pan, type text, and switch Spaces.
+calculator over USB. From the calculator keypad you can move the pointer, click and
+double-click, scroll, zoom and pan, type text, look up words, and switch Spaces.
 
-> **This is Version 1 (v0.3.3)**: the first build that mirrored reliably on real
-> hardware.
+> **This is Version 2 (v0.3.4)**: faster screen updates through packed tiles, plus
+> new top-row controls (double-click, Quick Look / Look Up).
 > **Designed and tested on macOS Sequoia 15.3.1** (English system language) with a
-> TI-84 Plus CE Python. Other macOS versions and languages are untested.
+> TI-84 Plus CE Python running OS 5.8.0.022. Other macOS versions, languages and
+> calculator OS versions are untested.
 
 ## How it works
 
@@ -19,8 +20,12 @@ Mac84 has two parts:
 
 The bridge captures the main display, crops a 960×720 region (adjustable with zoom),
 scales it to the calculator's 320×240 screen and converts it to 256 colors (RGB332).
-It sends only the 16×16 tiles that changed, either raw or run-length encoded, over
-USB serial. The calculator acknowledges every four tiles and asks for the next batch.
+It sends only the 16×16 tiles that changed over USB serial, choosing the smallest
+encoding for each tile: raw, run-length encoded, or palette-packed. Packing suits text
+and interface elements: a tile with up to 16 colors is sent as a small palette plus
+1-, 2- or 4-bit indices, 34 to 145 bytes instead of 256. Each group of four tiles goes
+out as one paced stream. The calculator acknowledges every group and asks for the next
+batch.
 Keypresses travel the other way and become real mouse and keyboard events on the Mac.
 
 Everything stays on the USB cable. The bridge opens no network connections and
@@ -30,7 +35,7 @@ uploads nothing.
 
 **Hardware**
 
-- A TI-84 Plus CE (Mac84 was developed on the Python edition).
+- A TI-84 Plus CE (Mac84 was developed on the Python edition, OS 5.8.0.022).
 - A USB cable that carries data. The one that came with the calculator works; a Mac
   with only USB-C ports needs an adapter.
 - A Mac running macOS Sequoia (tested on 15.3.1).
@@ -56,8 +61,8 @@ uploads nothing.
 3. Install arTIfiCE by following the instructions on
    [its page](https://yvantt.github.io/arTIfiCE/). Pick the version that matches your
    calculator OS (check with `2nd` → `MEM` → `About`):
-   - **OS 5.8.4 or earlier:** arTIfiCE v2.1. Send `arTIfiCE_v2.1.8xp`, then open the
-     `prgm` menu, choose `A`, and press `enter`.
+   - **OS 5.8.4 or earlier** (including the tested 5.8.0.022): arTIfiCE v2.1. Send
+     `arTIfiCE_v2.1.8xp`, then open the `prgm` menu, choose `A`, and press `enter`.
    - **OS 5.8.5:** arTIfiCE v3, which has its own install steps on the same page.
    - **OS 5.4 or earlier:** arTIfiCE is not needed.
 4. Send `calculator/bin/MAC84.8xp` from this repository to the calculator. It is
@@ -96,7 +101,7 @@ the permissions to that app instead.
 
 1. Plug the calculator into the Mac.
 2. On the calculator, start arTIfiCE and choose **MAC84**. The screen shows
-   `MAC84 v0.3.3 - DIAGNOSTIC STOPS` and `Waiting for Mac bridge...`.
+   `MAC84 v0.3.4` and `Waiting for Mac bridge...`.
 3. Within 80 seconds, start the bridge from the `Mac84` folder:
 
    ```sh
@@ -105,8 +110,9 @@ the permissions to that app instead.
 
    You can also double-click `mac/run_mac.command`, which runs the same command.
 
-4. Terminal prints `Mac84 v0.3.3 bridge on /dev/cu.usbmodem...`. The first full screen
-   arrives in about ten batches; after that, only changed areas are sent.
+4. Terminal prints `Mac84 v0.3.4 bridge on /dev/cu.usbmodem...`, then
+   `[usb] Calculator greeting @M84|5; packed tiles on`. The first full screen arrives
+   in about ten batches; after that, only changed areas are sent.
 
 **To stop:** press `MODE` on the calculator. In this version the bridge then reports
 `USB serial port disappeared`, which is expected after a MODE quit. It restores your
@@ -120,6 +126,10 @@ Mac settings before it exits. You can also press `Ctrl+C` in Terminal; wait for 
 | Arrows | Move the pointer |
 | `2nd` + arrows | Pan the view |
 | `trace` / `graph` | Left / right click |
+| `zoom` | Double-click |
+| `y=` | Over a Finder item: Quick Look (press `y=` again to close). Elsewhere: Look Up the word under the pointer |
+| `window` | Mission Control *(see note below)* |
+| `2nd` + `window` | App Exposé, the current app's windows *(see note below)* |
 | `+` / `−` | Zoom in / out (fully zoomed out fits the whole desktop) |
 | `^` / `÷` | Scroll up / down |
 | `vars` / `clear` | Switch to the Space on the left / right |
@@ -131,6 +141,11 @@ There are five zoom levels: the whole desktop, 960×720 (the default), 640×480,
 480×360, and 320×240. When the desktop's shape
 does not match the calculator screen, black bars fill the gap; pointer moves and
 clicks in the bars are ignored.
+
+**Note on `window`:** this version sends Control+Up / Control+Down without the `fn`
+flag that macOS expects on arrow-key shortcuts. On Sequoia the active app usually
+receives a plain arrow key instead, and Mission Control does not open. A later
+version fixes this.
 
 ### Typing text
 
@@ -190,7 +205,9 @@ The settings helper starts only after the first full screen has arrived, and the
 mirroring continues while it works. Your original values are saved in
 `~/Library/Application Support/Mac84/previous_settings.json` before anything changes.
 If the bridge is interrupted, the next run restores them first. If a restore fails,
-the file is kept. Do not delete it; with the bridge stopped, run:
+the file is kept. In this version that happens most often with
+`Could not find Reduce motion`, when System Settings is closed or still loading as the
+bridge stops. Do not delete the file; with the bridge stopped, run:
 
 ```sh
 ./.venv/bin/python mac/mac84_bridge.py --restore-settings
@@ -206,12 +223,13 @@ To mirror without touching any settings, add `--no-mac-settings`.
 | `--port /dev/cu.usbmodem...` | Use a specific port |
 | `--list-ports` | List candidate serial ports and exit |
 | `--pace 0.003` | Delay in seconds after every 48 bytes sent over USB |
-| `--verbose` | Log every request, batch and timing |
+| `--verbose` | Log every request, plus each batch's tile kinds, capture and transfer time, and KB/s |
+| `--ack-window 2` | *Experimental:* allow one more tile group in flight before waiting for its acknowledgment (default 1) |
 | `--no-mac-settings` | Do not change or restore any Mac settings |
 | `--restore-settings` | Restore settings saved by an interrupted run, then exit |
 | `--link-test` | Test the USB handshake and acknowledgments without capture or input |
 | `--preview FILE.png` | Save what the calculator would show, without USB |
-| `--benchmark` | Analyze compression for one frame, without USB or input |
+| `--benchmark` | Analyze compression and USB chunk counts for one frame, without USB or input |
 | `--mock-image FILE` | Send a static image instead of the live screen |
 | `--display N` | Capture macOS display number N (default 1) |
 
@@ -221,10 +239,11 @@ To mirror without touching any settings, add `--no-mac-settings`.
 | --- | --- |
 | Calculator says `No bridge after 80 sec` | Start the bridge sooner after launching MAC84 |
 | Bridge cannot find the calculator | Quit TI Connect CE, use a data-capable cable, and run `--list-ports` |
-| Calculator shows a `MAC84 v0.3.3 STOPPED` panel | It lists the reason and the USB stage. Note it, then press `clear` |
+| Calculator shows a `MAC84 v0.3.4 STOPPED` panel | It lists the reason and the USB stage. Note it, then press `clear` |
 | Image is blank or capture fails | Screen & System Audio Recording permission for Terminal |
 | Pointer moves on the calculator but not on the Mac | Accessibility permission for Terminal |
-| `Could not find Reduce motion...` | Automation permission, and an English system language. Mirroring continues anyway; `--no-mac-settings` skips this step |
+| `Could not find Reduce motion...` | Automation permission, and an English system language. Mirroring continues anyway; `--no-mac-settings` skips this step. If it appears while stopping, run `--restore-settings` |
+| Mirroring stops when trying `--ack-window 2` | Go back to the default (leave the option off) |
 | Terminal output makes the image busy | Keep Terminal outside the captured area |
 
 For a detailed log to attach to an issue:
@@ -239,7 +258,7 @@ For a detailed log to attach to an issue:
 ./.venv/bin/python -m unittest discover -s tests
 ```
 
-The 49 tests use mocks and never change your real Mac settings. They include a pipe
+The 57 tests use mocks and never change your real Mac settings. They include a pipe
 test that connects the real Python sender to the real C frame parser, compiled for the
 Mac with clang (from Xcode Command Line Tools). These are host simulations, not a
 calculator emulator.
@@ -266,3 +285,7 @@ The result is `calculator/bin/MAC84.8xp`.
   by the CE-Programming team, which provide the USB serial driver MAC84 is built on.
 - [arTIfiCE](https://yvantt.github.io/arTIfiCE/) by YvanTT, which makes it possible
   to run native programs on current calculator OS versions.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

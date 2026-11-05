@@ -31,9 +31,9 @@ int main(int argc, char **argv) {
     char greeting[50];
     assert(argc == 2);
     link_open = true;
-    assert(send_line("@M84\n"));
+    assert(send_line("@M84|5\n"));
     assert(recv_line(greeting, sizeof(greeting), 8));
-    assert(!strcmp(greeting, "@M84READY"));
+    assert(!strcmp(greeting, "@M84READY|5"));  /* packed tiles negotiated */
     online = true;
     for (int i = 0; i < 11; i++) assert(fetch_frame());
     cursor_hide();
